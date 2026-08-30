@@ -757,7 +757,7 @@ specific to two Morse radios talking to each other with one side in the (alpha) 
 role; a flat `0` there too would mean the gap is broader - in the STA-side RX RSSI capture itself,
 regardless of what's on the other end.
 
-#### Sixth Aug 30 finding: a relay's 8 MHz HaLow AP shows as *two* scan entries on a leaf, neither at 8 MHz - almost certainly expected, not a bug
+#### Sixth Aug 30 finding: a relay's 8 MHz HaLow AP shows as *two* scan entries on a leaf, neither at 8 MHz - confirmed expected, not a bug
 
 Raised as a live question during the memory-headroom work above: a relay's HaLow AP configured at
 `op_class 4, s1g_chan_num 12` (908.000 MHz, 8 MHz - confirmed via `gwcfg-show` on the relay) was
@@ -784,15 +784,35 @@ landed. Cross-checked against the real US regdb table (`mmregdb.c` L319-369): 90
 905.000 MHz/2 MHz are both real, exact table entries, and both frequencies fall inside the AP's
 actual 904-912 MHz (908 MHz ± 4 MHz) 8 MHz span - not off in unrelated spectrum.
 
-**Not yet 100% certain**, because the *contents* of the S1G Operation element weren't parsed - only
-inferred from which frequencies scan reported. Full certainty would mean parsing the raw IE
-(`mmwlan_scan_result.ies`/`ies_len` - already app-visible, public API) directly against the S1G
-Operation element's known byte layout, without depending on morselib's own private
-`ie_s1g_operation_parse()` (unexported outside its own translation unit, and the build already
-name-mangles this vendored library - see "Creating mangled libmorse" in the build log - so its
-availability at link time isn't guaranteed either). Deferred rather than built speculatively: the
-frequency/bandwidth evidence above already converges strongly enough that this is treated as
-resolved-by-inference for now; revisit only if it turns out to matter for a real decision.
+**Confirmed by direct test, same day**: reconfigured the relay's HaLow AP from `op_class 4,
+s1g_chan_num 12` (8 MHz) to `op_class 69, s1g_chan_num 26` (915.000 MHz, 2 MHz) via
+`gwcfg-set-halow-ap` + `gwcfg-save` + reboot, matched the leaf's stored uplink credentials with
+`gwcfg-set-uplink` + `gwcfg-save` + reboot, confirmed reassociation (`halow ap stas: 1` on the
+relay, `uplink state: up` with a real lease on the leaf), then reran `gwcfg-scan` from the leaf:
+
+```
+SSID                             BSSID                  RSSI         FREQ  BW
+d3MOUS-relay                     f6:ab:5c:df:41:15     0 dBm   915.000 MHz   2 MHz
+1 AP(s) found
+```
+
+Exactly one entry, exactly matching the AP's real operating channel - no primary/operating split,
+because a 2 MHz operating channel is already narrow enough to serve as its own primary. That the
+split disappears precisely when the operating channel no longer needs a separate narrower primary
+is about as clean a confirmation as this could get without parsing the raw IE. The IE-parsing route
+above remains undone and is no longer worth doing for this question specifically - filed only if a
+future need for it shows up on its own. `RSSI 0 dBm` reproduced identically at 2 MHz, confirming
+that part is unrelated to bandwidth, same driver bug as the Second Aug 30 finding below.
+
+**Project steer, decided the same day**: the relay's bench config now runs 2 MHz
+(`op_class 69, s1g_chan_num 26`) instead of 8 MHz, matching the "prefer 1-2 MHz" recommendation
+`HARDWARE.md`'s "Channel bandwidth" section already argued for on link-margin/range and
+heap-pressure grounds - this test is the real-hardware confirmation that recommendation was
+pointing the right way, including a side benefit neither of those original arguments anticipated:
+simpler, unambiguous scan/discovery output. One unrelated observation from the same session,
+noted but not chased: `gwcfg-scan` from an already-associated leaf knocks its own uplink loose
+right as the scan starts, at both 8 MHz and 2 MHz - reconnects on its own within a few seconds
+either way.
 
 **What's still a real, separate, tracked bug**: both entries read `RSSI 0 dBm` - the exact
 "Second Aug 30 finding" flat-RSSI issue below, reproduced again here on both firmware builds. This

@@ -364,6 +364,15 @@ the same defense - it caps the burst at the source instead of only reacting to i
 Reserve 4/8 MHz for a short, uncontested hop where the extra throughput is actually usable (e.g. a
 relay sitting a few meters from its Pi) and range/obstruction margin isn't the binding constraint.
 
+**Confirmed on real hardware 2026-08-30** (see `ROADMAP.md`'s "Sixth Aug 30 finding"): the bench
+relay/leaf pair now runs `op_class 69, s1g_chan_num 26` (915.000 MHz, 2 MHz) rather than the 8 MHz
+config it started on. Beyond the range/heap-pressure reasoning above, this also turned out to make
+scan/discovery unambiguous - at 8 MHz the leaf's `gwcfg-scan` reported the same AP as two separate
+entries (its primary 1 MHz and primary 2 MHz sub-channels, neither at the AP's actual 8 MHz
+operating frequency); at 2 MHz it reports exactly one entry, matching the real operating channel,
+because a channel that narrow needs no separate primary. **This is now the project's default
+recommendation, not just a theoretical one** - start new deployments at 1-2 MHz.
+
 ### Why not the other eight regions
 
 An earlier version of this repo built nine regions — US, CA, EU, GB, AU, NZ, JP, KR, IN — on the
