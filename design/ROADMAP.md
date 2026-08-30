@@ -6,7 +6,7 @@ you're picking the project back up.**
 - Companion docs: [`HARDWARE.md`](HARDWARE.md) (what to buy, how to build one, how to bring it up),
   [`PI_SIDE.md`](PI_SIDE.md) (the other end of the link)
 - Architecture diagram and repo layout: [`../README.md`](../README.md)
-- **Last updated:** 2026-08-21
+- **Last updated:** 2026-08-30
 
 Keep this file current: tick the checklist when a step passes, move an item out of "not built yet"
 when it lands, and add to "settled decisions" rather than re-arguing one. Historical detail
@@ -85,11 +85,11 @@ callback, check which task will run it and what stack that task has.
 | Local SoftAP + DHCP | `main/downlink_softap.c` | 2.4 GHz AP + DHCP server for phones/tablets/ATAK devices. GW_ROLE_CLIENT only. |
 | HaLow STA uplink | `main/uplink_halow.c` | STA association, reconnect/backoff, bounded DHCP wait with disconnect-and-retry. Exposes a four-state link state, RSSI, a blocking scan wrapper, and radio version readback. GW_ROLE_CLIENT only. |
 | Wi-Fi STA uplink | `main/uplink_wifi.c` | GW_ROLE_RELAY only - native `esp_wifi` STA joining the Pi's own local AP directly (item 8 below). Same link-state/RSSI/callback shape as `uplink_halow.c`, event-driven reconnect against standard ESP-IDF STA events rather than a blocking task. |
-| HaLow AP downlink | `main/downlink_halow_ap.c` | GW_ROLE_RELAY only - HaLow radio in AP mode (`CONFIG_HALOW_AP_MODE`) so other XIAOs can associate to this node instead of a Pi (item 8 below). Static IP, no DHCP server - see the file's own header comment for why. Also exposes the regulatory channel table so an operator can pick a legal (op_class, s1g_chan_num) pair. **Untested on real hardware** - Morse's own AP-mode API is marked alpha. |
+| HaLow AP downlink | `main/downlink_halow_ap.c` | GW_ROLE_RELAY only - HaLow radio in AP mode (`CONFIG_HALOW_AP_MODE`) so other XIAOs can associate to this node instead of a Pi (item 8 below). Static IP, no DHCP server - see the file's own header comment for why. Also exposes the regulatory channel table so an operator can pick a legal (op_class, s1g_chan_num) pair. **Confirmed on real hardware as of 2026-08-30**: starts cleanly, a leaf XIAO associates over HaLow, the downlink netif reports up (fixed - see "What the Aug 30 datapath-race run proved" below), and NAT + the CoT relay both come up behind it. `mmhalow_wifi_start()` itself still returns no code to confirm the AP came up (hence `gwcfg-status`'s "best-effort" wording for that one specific claim), but everything downstream of it now has independent confirmation. One known gap remains: `mmwlan_tx_pkt` intermittently logs "Unable to infer VIF ID" for some outbound multicast frames (~every 55s) - not yet confirmed whether this actually blocks CoT delivery to a HaLow leaf. Morse's own AP-mode API is still marked alpha. |
 | NAT / IP forwarding | `main/ip_forward_nat.c` | All three steps of ESP-IDF's NAT recipe: DNS propagation into the SoftAP's DHCP offers, uplink as default route, NAPT on the downlink. |
 | CoT multicast relay | `main/cot_relay.c` | One socket joined to 239.2.3.1:6969 on both netifs, `IP_PKTINFO`/`recvmsg()` for arrival interface, loop prevention via `IP_MULTICAST_LOOP` off + own-source drop. |
 | Provisioning | `main/provisioning.c` | NVS config blob (magic + version stamped, validated on load and save) plus `gwcfg-*` console commands over USB Serial/JTAG. `gwcfg-set-role` selects GW_ROLE_CLIENT/GW_ROLE_RELAY at runtime - one firmware image, no separate relay build. |
-| Web config UI | `main/web_ui.c` / `.html` | `esp_http_server` + embedded HTML. `GET /api/status`, `GET`/`POST /api/config`, `GET /api/log`, `GET /api/tasks`, `POST /api/scan`, `POST /api/reboot`. Same NVS config as the console. SoftAP clients only; **no authentication yet**. |
+| Web config UI | `main/web_ui.c` / `.html` | `esp_http_server` + embedded HTML. `GET /api/status`, `GET`/`POST /api/config`, `GET /api/log`, `GET /api/tasks`, `POST /api/scan`, `POST /api/reboot`. Same NVS config as the console. Downlink clients only by default (SoftAP for GW_ROLE_CLIENT, HaLow AP for GW_ROLE_RELAY); **no authentication yet**. `allow_uplink_management` (off by default, `gwcfg-set-uplink-mgmt on\|off` or the web UI) opts a node into also accepting requests addressed to its own uplink IP - confirmed on real hardware 2026-08-30 (a relay reachable from its Wi-Fi uplink's subnet once enabled; a client on an unrelated third network that only routes there was correctly still refused - that's peer-subnet matching working as scoped, not a bug). |
 | Status LED | `main/status_led.c` | On-board GPIO21 LED blinks the uplink link state. The only instrument needing neither cable nor phone. |
 | Factory reset | `main/factory_reset.c` | 5 s BOOT-button hold restores defaults and reboots; LED acknowledges at 1.5 s. |
 | Stack headroom | `main/task_stats.c` | Worst-case free stack per task via `uxTaskGetStackHighWaterMark()`, surfaced as `gwcfg-tasks` and `GET /api/tasks`. Turns "is this close to overflowing?" into a number - see "Stack budgets" below. |
@@ -465,9 +465,79 @@ re-verified on hardware:
   (5s, 100ms steps) on `esp_netif_is_netif_up()` for the downlink netif before either NAT or the CoT
   relay touch it.
 
-Neither fix has a confirmed clean hardware run yet — the next relay test should specifically watch
-for a clean boot straight into "NAPT enabled on the SoftAP interface, uplink is default route" with
-no crash loop first.
+Neither fix had a confirmed clean hardware run at the time this was written. The boot-loop fix has
+since been retested (2026-08-29, two physical nodes, both roles) and needed a second fix on top of
+it - see "What the Aug 29 relay run proved" below. The datapath-race fix turned out to be papering
+over a different bug entirely - `wait_for_downlink_up()`'s timeout was never going to be long
+enough, because the downlink netif was never going to report up at all. See "What the Aug 30
+datapath-race run proved" below for the real fix.
+
+#### What the Aug 29 relay run proved
+
+The boot-loop fix above (`halow_radio_force_reset()`) turned out to be necessary but not
+sufficient: configuring a node as GW_ROLE_RELAY with a HaLow AP and rebooting from the web UI
+reproduced the *same* interrupt-watchdog panic in task `ipc0`, 38 times in a row across a single
+test, on two different physical nodes, surviving a factory reset and a full USB power cycle in
+between. Symbolized with `idf.py coredump-info` this time (not just the raw backtrace addresses
+from the panic handler): the crash is inside `gpio_install_isr_service()` itself -
+`esp_intr_alloc() -> ... -> gpio_isr_loop()` - interrupted while installing the shared GPIO ISR,
+with the crashing task's own PC landing back inside `gpio_isr_loop`. That is the shared dispatcher
+spinning on a pending interrupt with no per-pin handler registered yet to service it - which happens
+when a pin is already configured level-triggered and asserted the moment the shared ISR is enabled.
+
+`managed_components/morsemicro__halow/components/shims/mmhal_wlan.c:237` configures exactly one pin
+that way - `gpio_set_intr_type(CONFIG_MM_SPI_IRQ, GPIO_INTR_LOW_LEVEL)` - as part of normal AP-mode
+bring-up. `halow_radio_force_reset()`'s pulse only resets the *radio chip* via `CONFIG_MM_RESET_N`;
+it can't touch this, because it's a register on the ESP32-S3's own GPIO peripheral, not the chip's.
+`esp_restart()` triggers what esp-idf's own source calls a "system reset" (`esp_system/esp_system.c`
+`esp_restart_noos()`, via the RTC watchdog's `WDT_STAGE_ACTION_RESET_SYSTEM`) - and 38 identical
+crashes on pure software reboots, no power cycle between any of them, confirm that reset does not
+clear this particular register. So once one boot arms it, every following `esp_restart()` re-arms
+the same storm before a handler exists to service it - a genuinely different mechanism from the
+RESET_N timing issue the first fix targeted, not a sign that fix was wrong.
+
+Fixed by extending `halow_radio_force_reset()` (`main/app_main.c`) with `gpio_reset_pin
+(CONFIG_MM_SPI_IRQ)`, called before `mmhalow_init()` ever runs on any boot. `gpio_reset_pin()`
+(esp-idf v5.5.1 `esp_driver_gpio/src/gpio.c:456`) calls `gpio_intr_disable()` first, which writes
+`GPIO_INTR_DISABLE` into that same hardware field directly - clearing it regardless of what a
+previous, possibly-crashed boot left armed. Confirmed clean on both physical nodes immediately
+after: HaLow radio up (real chip ID and MAC, not the zeroed readback a dead SPI transport gives),
+HaLow AP started, native Wi-Fi uplink associated and got a DHCP lease - the same
+config-then-web-UI-reboot sequence that crash-looped every time before now boots straight through.
+
+#### What the Aug 30 datapath-race run proved
+
+`gwcfg-status` on a live, otherwise-healthy relay (Wi-Fi uplink up, HaLow AP started, a leaf
+associated) kept reporting `cot relay: not started`, unrecovered because nothing about the design
+retries once the uplink stays connected (see `datapath_task()`'s own comment on why it's
+correct to only retry on reconnect). Root cause was not a timing issue at all, despite looking
+like one: `wait_for_downlink_up()` polls `esp_netif_is_netif_up()`, which only becomes true once
+something calls `esp_netif_action_connected()` on that netif - and for the HaLow AP downlink,
+nothing ever did. `mmhalow_init()` only wires `mmwlan_register_link_state_cb()`
+(`managed_components/morsemicro__halow/mmhalow.c` L215), and that callback's own doc comment in
+`mmwlan.h` says outright: "This link status callback will not be invoked in AP mode." No timeout
+value, however large, was ever going to fix this - the netif was never going to report up by that
+path, cold boot or warm.
+
+Fixed in `main/downlink_halow_ap.c` by registering `mmwlan_register_vif_state_cb(MMWLAN_VIF_AP, ...)`
+instead - the non-deprecated replacement, which carries no such AP-mode exclusion in its doc
+comment - and calling `esp_netif_action_connected()`/`_disconnected()` from it directly, mirroring
+`mmhalow_link_state()`'s own call shape exactly. Confirmed on real hardware immediately after: the
+downlink netif reported up (`sta_native ip: 172.16.60.1`) within ~2.8s of boot, well before the
+Wi-Fi uplink even associated, and the boot proceeded straight through to `NAPT enabled on the
+SoftAP interface, uplink is default route` and `CoT relay joined 239.2.3.1:6969 on both interfaces`
+with no wait at all - the exact success sequence this file has been asking a relay test to produce
+since the Aug 22 run.
+
+One new, separate issue surfaced by finally reaching this code path: `mmwlan_tx_pkt` logs
+`Unable to infer VIF ID` / `Packet failed to send` roughly every ~55s (first occurrence just before
+CoT relay's own join log, so likely lwIP's periodic IGMP membership-report refresh rather than CoT
+traffic itself) - a gap in how the vendored AP-mode driver resolves which station a multicast frame
+should go to when the destination doesn't uniquely resolve to one. Not yet investigated further;
+CoT relay itself starts and stays up regardless, so this doesn't block the fix above, but it may
+mean some outbound multicast frames toward HaLow leaves are silently dropped periodically. Next
+relay session should check whether this actually blocks real CoT delivery to a HaLow-side leaf, or
+is cosmetic.
 
 ## Settled decisions
 
@@ -502,6 +572,21 @@ Recorded so they aren't relitigated, and so they aren't accidentally undone.
   and esp_netif's own 192.168.4.1 default; an overlap between a client's remembered network and
   this one is very hard to diagnose in the field. Every node can safely use the same subnet — each
   NATs behind its own uplink address.
+- **A relay's HaLow AP runs no DHCP server; every leaf that joins it needs a manually-assigned
+  static IP in the same /24** (`gwcfg-set-uplink-static-ip`, or the web UI's "Use static IP").
+  Verified twice against real source, not memory: `mmhalow_init()`
+  (`managed_components/morsemicro__halow/mmhalow.c:205-206`) always builds its netif from
+  `ESP_NETIF_DEFAULT_WIFI_STA()` and calls `esp_netif_new()` itself, with no caller-supplied config
+  and regardless of STA/AP mode, so `esp_netif->dhcps` is never allocated (`esp_netif_lwip.c:837`
+  at v5.5.1 only calls `dhcps_new()` when `ESP_NETIF_DHCP_SERVER` was set *at that call*). Calling
+  the public `esp_netif_dhcps_start()` on this netif anyway doesn't just fail - `esp_netif_lwip.c:1698`
+  unconditionally calls `dhcps_set_new_lease_cb(esp_netif->dhcps, ...)`, a null-pointer dereference,
+  a hard crash. The only way around it is either patching the vendored `mmhalow.c` (it's regenerated
+  from the component registry - don't) or reaching into `esp_netif_t`'s private internals (fragile
+  across ESP-IDF versions - also don't). **The real v2 fix, deliberately deferred (2026-08-29,
+  operator feedback that manual bookkeeping doesn't scale past a couple of nodes): a small DHCP
+  server written from scratch** - a plain UDP socket on port 67 handling DISCOVER/OFFER/REQUEST/ACK
+  for a handful of leases, entirely independent of esp_netif's built-in server. Not started.
 - **US-only, 902–928 MHz — and that is a hardware limit.** The module is a Quectel FGH100M-H, a
   902–928 MHz part, and the BCF the firmware loads (`bcf_fgh100mhaamd.bin`) is named "FGH100M-H
   (US)" upstream; it carries real calibration for US alone. The nine-region build matrix that used
@@ -563,11 +648,11 @@ through a reconnect or two, since a high-water mark only reflects paths that hav
 
 | Context | Stack | Notes |
 |---|---|---|
-| `sys_evt` (esp_event default loop) | **2816** | 2304 Kconfig default + 512 `TASK_EXTRA_STACK_SIZE`. Not overridden. **The tightest budget in the system, and it runs every event handler.** |
+| `sys_evt` (esp_event default loop) | **4608** | `CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096` (`sdkconfig.defaults`) + 512 `TASK_EXTRA_STACK_SIZE`. Was 2816 (the 2304 Kconfig default, never overridden) until 2026-08-30: measured at 472 bytes free on real hardware on both roles after a reconnect cycle each - inside this project's own "tight, raise it" band (`gwcfg-tasks`: <512 B) - even with the item-8 deep call chain already moved off it. Raised to match this project's other worker tasks, plus a real fix alongside it: `uplink_wifi.c`'s `WIFI_EVENT_STA_START` case called `esp_wifi_connect()` directly rather than deferring to `wifi_reconnect_task` like `schedule_reconnect()` already does for the same call - inconsistent with the discipline below, though not the dominant cost - fixing it only moved the pre-bump measurement from 440 to 472 bytes free, see the `sdkconfig.defaults` comment for the full numbers. Now 2376-2436 bytes free (~49%) on both roles after the stack bump. **Still runs every event handler this firmware registers - budget generously, not exactly.** |
 | `esp_timer` task | 4096 | 3584 + 512. Runs `reconnect_timer_cb`, `reboot_timer_cb` — both trivial by design. |
 | `datapath` | 4096 | Where NAT + CoT relay bring-up actually runs. **Exits once the datapath is up**, returning the 4 KB — so `absent` is the healthy steady state in `gwcfg-tasks`, and still-present means an attempt is outstanding. |
-| `wifi_reconnect`, `halow_reconnect`, `cot_relay`, `factory_reset` | 4096 each | |
-| httpd (`web_ui.c`) | 6144 | Raised from esp_http_server's 4096 default. |
+| `wifi_reconnect`, `halow_reconnect`, `cot_relay`, `factory_reset` | 4096 each | `factory_reset` looked oversized at idle (84% free - the task body is just a GPIO poll) until actually measured mid-reset on real hardware (2026-08-30, physical BOOT-button hold, caught with a rapid `gwcfg-tasks` poll in the ~250ms window before `do_factory_reset()`'s `esp_restart()`): 1764 bytes free (57% used, 43% margin) during the real `provisioning_save()` NVS write - this is the recovery path of last resort (see `factory_reset.c`'s own comment), so that margin is earned, not spare to reclaim. |
+| httpd (`web_ui.c`) | 6144 | Raised from esp_http_server's 4096 default. Same "looks oversized at idle" trap: 81% free (20% used) reflected only light `GET` traffic until a real max-field `POST /api/config` was sent to a live relay on 2026-08-30 (curled directly from a dev machine sharing the relay's uplink subnet, `allow_uplink_management` already on) - dropped to 1648 bytes free (74% used, 26% margin), confirming the raise was load-bearing, not generous. **The general lesson from both of these: `uxTaskGetStackHighWaterMark()` is a floor on "used," not a ceiling - a task sitting at high "free" may just mean its worst path hasn't run yet this boot. Don't trim a budget from an idle-since-boot number; exercise the task's actual heaviest path first.** |
 | console REPL (`provisioning.c`) | 4096 | `ESP_CONSOLE_REPL_CONFIG_DEFAULT()`. |
 | `status_led` | 2048 | Deliberately small — the task body reads an enum and toggles a pin. It must stay that way; it has no room for a log call. |
 | morselib `evtloop` (SDK-owned) | 8608 | `umac_evtloop.c` asks for 2152 **words**; the ESP32 shim converts (`stack_size_u32 * 4`, `mmosal_shim_freertos_esp32.c` L216-221). This is what invokes `mm_sta_state_cb` and `scan_rx_cb` — so `web_ui.c`'s cJSON scan collector runs on an SDK task, not ours, and fits. |

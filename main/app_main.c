@@ -418,6 +418,36 @@ static void halow_radio_force_reset(void)
     }
     gpio_set_level(CONFIG_MM_RESET_N, 0);
     vTaskDelay(pdMS_TO_TICKS(50));
+
+    /* Reproduced on real hardware in GW_ROLE_RELAY specifically (HaLow AP
+     * mode): once armed, every subsequent esp_restart() reboot panics with
+     * "Interrupt wdt timeout on CPU0" inside gpio_install_isr_service() -
+     * before mmhal_init() (components/shims/mmhal_os.c) or anything it calls
+     * has logged a single line - with the crashed task's own PC landing in
+     * gpio_isr_loop (esp-idf v5.5.1 esp_driver_gpio/src/gpio.c). That is the
+     * shared GPIO ISR dispatcher spinning on an interrupt no per-pin handler
+     * is registered for yet, which happens when a pin is already configured
+     * level-triggered and asserted at the moment the shared ISR is enabled.
+     *
+     * components/shims/mmhal_wlan.c:237 configures exactly one pin that way -
+     * gpio_set_intr_type(CONFIG_MM_SPI_IRQ, GPIO_INTR_LOW_LEVEL) - as part of
+     * normal AP-mode bring-up. The RESET_N pulse above only resets the
+     * *radio chip*; it can't touch this, because it's a register on the
+     * ESP32-S3's own GPIO peripheral, not the chip's. esp_restart() triggers
+     * what esp-idf calls a "system reset" (esp_system/esp_system.c
+     * esp_restart_noos(), via the RTC watchdog's WDT_STAGE_ACTION_RESET_SYSTEM)
+     * - and 38 identical crashes in a row on pure software reboots (no power
+     * cycle in between, confirmed on real hardware) show that reset does not
+     * clear this particular register, so once one boot arms it, every
+     * following esp_restart() re-arms the same storm before a handler is
+     * registered to service it.
+     *
+     * gpio_reset_pin() (v5.5.1 esp_driver_gpio/src/gpio.c:456) calls
+     * gpio_intr_disable() first, which writes GPIO_INTR_DISABLE into that
+     * same hardware field directly - so this clears it regardless of what a
+     * previous, possibly-crashed boot left armed, before mmhalow_init() ever
+     * runs. A no-op if the pin was already clean. */
+    gpio_reset_pin(CONFIG_MM_SPI_IRQ);
 }
 
 /* Today's original design: local 2.4GHz SoftAP for phones/ATAK devices,

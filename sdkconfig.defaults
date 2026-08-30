@@ -213,3 +213,31 @@ CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 # first thing to flip back - and it should be re-added deliberately, with the
 # roadmap decision revisited, rather than left on by default in case.
 CONFIG_LWIP_IPV4_NAPT_PORTMAP=n
+
+# The default event loop task ("sys_evt" in gwcfg-tasks/GET /api/tasks) runs
+# every esp_event handler this firmware registers on the default loop
+# (uplink_wifi.c's WIFI_EVENT/IP_EVENT handler, uplink_halow.c's IP_EVENT
+# handler) plus whatever ESP-IDF's own Wi-Fi/netif internals post there - on
+# a stack this project has never sized itself, just inherited the Kconfig
+# default of 2304 (esp_system/Kconfig L219-221 at v5.5.1) plus the 512-byte
+# TASK_EXTRA_STACK_SIZE that CONFIG_NEWLIB_NANO_FORMAT=n (this project's own
+# choice, for integer-only frequency formatting - see main/board.h and
+# design/ROADMAP.md) adds to every task, for 2816 bytes total.
+#
+# One real overflow on this exact task already happened here (item 8,
+# design/ROADMAP.md) from a deep call chain that has since been moved off
+# it entirely (app_main.c's datapath_task()). Measured on real hardware after
+# that fix, on both a GW_ROLE_CLIENT and a GW_ROLE_RELAY node through a
+# reconnect cycle each (2026-08-30): 2816 - 472 = 2344 bytes used at its
+# worst, which is inside this project's own "tight, raise it" band
+# (main/provisioning.c's cmd_gwcfg_tasks: <512 B free) and one dropped
+# connection away from the <256 B "CRITICAL" band - not overflowing today,
+# but with far less margin than every other task in this firmware carries,
+# on a task shared with ESP-IDF's own internal event consumers, whose stack
+# needs can grow with any component update this project doesn't control.
+#
+# 4096 matches this project's other worker tasks (wifi_reconnect, datapath,
+# console_repl, factory_reset), leaving roughly 1750 bytes (49%) free at the
+# measured worst case - comfortably clear of both bands with real headroom
+# for whatever ESP-IDF itself needs there in the future.
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096

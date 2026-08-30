@@ -59,6 +59,16 @@ esp_netif_t *downlink_halow_ap_get_netif(void);
  * came up on air. */
 bool downlink_halow_ap_is_started(void);
 
+/* Number of leaf XIAOs currently associated to this AP. Unlike
+ * downlink_halow_ap_is_started(), this *is* proof the AP is on air - it's
+ * derived from mmwlan_ap_args.sta_status_cb, which only fires once the radio
+ * has a real STA to report on. Tracked by AID (mmwlan.h's
+ * MMWLAN_AP_MAX_STAS_LIMIT bounds it to 20) rather than a running counter,
+ * so a state callback firing more than once for the same STA (e.g.
+ * re-authenticating without ever dropping to UNKNOWN) can't double-count or
+ * double-decrement it. */
+uint8_t downlink_halow_ap_get_sta_count(void);
+
 /* One HaLow channel from the regulatory domain table CONFIG_HALOW_COUNTRY_CODE
  * already loaded (mmwlan_lookup_regulatory_domain() against get_regulatory_db()
  * - the same table mmhalow_init() points mmwlan_set_channel_list() at, so

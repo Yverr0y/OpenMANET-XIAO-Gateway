@@ -10,6 +10,7 @@
 #include "esp_app_desc.h"
 #include "esp_console.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -59,12 +60,29 @@ void provisioning_get_defaults(gw_config_t *cfg)
     cfg->magic = GW_CONFIG_MAGIC;
     cfg->version = GW_CONFIG_VERSION;
 
-    strlcpy(cfg->node_id, "xiao-gw-01", sizeof(cfg->node_id));
+    /* Last two bytes of the factory-burned base MAC, so two units on a bench
+     * don't both show up as "xiao-gateway" - esp_efuse_mac_get_default() reads
+     * BLK1 directly (esp-idf v5.5.1 components/esp_hw_support/mac_addr.c),
+     * so it works here before esp_wifi/esp_netif exist, and it's already
+     * unique per chip, unlike a randomly generated value nothing would need
+     * to persist. Falls back to "0000" if the read ever fails - not expected
+     * on real hardware, every chip ships with this fused. */
+    char mac_suffix[5] = "0000";
+    uint8_t mac[6];
+    if (esp_efuse_mac_get_default(mac) == ESP_OK) {
+        snprintf(mac_suffix, sizeof(mac_suffix), "%02x%02x", mac[4], mac[5]);
+    }
+
+    snprintf(cfg->node_id, sizeof(cfg->node_id), "xiao-gw-%s", mac_suffix);
 
     /* GW_ROLE_CLIENT: today's original design, and still what a factory-fresh
      * node ships as - a relay is a deliberate per-node choice
      * (gwcfg-set-role), not a default anyone should get by accident. */
     cfg->role = GW_ROLE_CLIENT;
+
+    /* Off: see gw_config.h's own comment. An operator opts a specific node
+     * into this, it never happens by accident. */
+    cfg->allow_uplink_management = false;
 
     /* No uplink by default, and deliberately no placeholder SSID.
      *
@@ -112,7 +130,7 @@ void provisioning_get_defaults(gw_config_t *cfg)
      * the field. 172.16.0.0/12 is the least-trafficked of the three RFC1918
      * blocks. Every XIAO node can safely use the same subnet - each one NATs
      * behind its own uplink address, so they never see each other's. */
-    strlcpy(cfg->softap.ssid, "xiao-gateway", sizeof(cfg->softap.ssid));
+    snprintf(cfg->softap.ssid, sizeof(cfg->softap.ssid), "xiao-gateway-%s", mac_suffix);
     strlcpy(cfg->softap.psk, "openmanet", sizeof(cfg->softap.psk));
     cfg->softap.channel = 6;
     cfg->softap.max_connections = 8;
@@ -417,6 +435,7 @@ static void print_config(const gw_config_t *cfg)
 {
     printf("node_id       : %s\n", cfg->node_id);
     printf("role          : %s\n", provisioning_role_name(cfg->role));
+    printf("uplink_mgmt   : %s\n", cfg->allow_uplink_management ? "on" : "off");
     if (cfg->role == GW_ROLE_RELAY) {
         printf("wifi_uplink.ssid: %s\n", cfg->wifi_uplink.ssid);
         printf("halow_ap.ssid : %s\n", cfg->halow_ap.ssid);
@@ -564,6 +583,27 @@ static int cmd_gwcfg_set_role(int argc, char **argv)
     return 0;
 }
 
+static int cmd_gwcfg_set_uplink_mgmt(int argc, char **argv)
+{
+    if (!s_cfg || argc != 2 || (strcmp(argv[1], "on") != 0 && strcmp(argv[1], "off") != 0)) {
+        printf("usage: gwcfg-set-uplink-mgmt <on|off>\n");
+        return 1;
+    }
+
+    provisioning_config_lock();
+    s_cfg->allow_uplink_management = (strcmp(argv[1], "on") == 0);
+    bool now_on = s_cfg->allow_uplink_management;
+    provisioning_config_unlock();
+
+    printf("uplink management %s in RAM; run 'gwcfg-save' then reboot to apply.%s\n",
+           now_on ? "enabled" : "disabled",
+           now_on ? " The config UI becomes reachable from whatever network this node's "
+                    "uplink joins - only do this for an uplink network you trust, "
+                    "there is still no login on the config UI itself."
+                  : "");
+    return 0;
+}
+
 /* Separate from gwcfg-set-uplink deliberately: this only matters when the
  * uplink is a GW_ROLE_RELAY's HaLow AP rather than a real Pi (see the long
  * comment on gw_uplink_config_t.use_static_ip), so it's an edge case worth
@@ -697,6 +737,7 @@ static int cmd_gwcfg_status(int argc, char **argv)
                                                                           "mmhalow_wifi_start() has no "
                                                                           "return code)"
                                                                        : "not started");
+        printf("halow ap stas : %u\n", downlink_halow_ap_get_sta_count());
         uplink_netif = uplink_wifi_get_netif();
     } else {
         uplink_link_state_t state = uplink_halow_get_link_state();
@@ -922,6 +963,7 @@ esp_err_t provisioning_register_console_commands(gw_config_t *cfg)
         { .command = "gwcfg-set-uplink", .help = "Set HaLow uplink STA config", .hint = NULL, .func = &cmd_gwcfg_set_uplink },
         { .command = "gwcfg-set-softap", .help = "Set local SoftAP config", .hint = NULL, .func = &cmd_gwcfg_set_softap },
         { .command = "gwcfg-set-role", .help = "Set node role: gwcfg-set-role <client|relay>", .hint = NULL, .func = &cmd_gwcfg_set_role },
+        { .command = "gwcfg-set-uplink-mgmt", .help = "Allow/deny reaching the config UI from this node's own uplink: gwcfg-set-uplink-mgmt <on|off>", .hint = NULL, .func = &cmd_gwcfg_set_uplink_mgmt },
         { .command = "gwcfg-set-uplink-static-ip", .help = "Set/clear a static IP on the uplink (relay leaves only)", .hint = NULL, .func = &cmd_gwcfg_set_uplink_static_ip },
         { .command = "gwcfg-set-wifi-uplink", .help = "Set the relay role's native Wi-Fi uplink to the Pi", .hint = NULL, .func = &cmd_gwcfg_set_wifi_uplink },
         { .command = "gwcfg-set-halow-ap", .help = "Set the relay role's HaLow AP downlink", .hint = NULL, .func = &cmd_gwcfg_set_halow_ap },

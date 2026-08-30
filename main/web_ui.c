@@ -81,54 +81,67 @@ static bool peer_ipv4(httpd_req_t *req, uint32_t *out_addr)
     return false;
 }
 
+/* This node's own uplink netif, for allow_uplink_management - HaLow STA for
+ * GW_ROLE_CLIENT, native Wi-Fi STA for GW_ROLE_RELAY. NULL (never matches)
+ * if s_cfg isn't set yet, same fail-closed shape as everything else here. */
+static esp_netif_t *uplink_netif(void)
+{
+    if (s_cfg == NULL) {
+        return NULL;
+    }
+    return (s_cfg->role == GW_ROLE_RELAY) ? uplink_wifi_get_netif() : uplink_halow_get_netif();
+}
+
+/* Is peer_addr on netif's own subnet? Fails closed: a netif with no address
+ * yet (or NULL) has no subnet for anything to be on. */
+static bool netif_owns_peer(esp_netif_t *netif, uint32_t peer_addr)
+{
+    if (netif == NULL) {
+        return false;
+    }
+    esp_netif_ip_info_t ip_info;
+    if (esp_netif_get_ip_info(netif, &ip_info) != ESP_OK || ip_info.ip.addr == 0) {
+        return false;
+    }
+    return (peer_addr & ip_info.netmask.addr) == (ip_info.ip.addr & ip_info.netmask.addr);
+}
+
 /* httpd_start() binds every interface, so once the HaLow uplink is up these
  * endpoints would otherwise be reachable from the entire mesh - including
  * unauthenticated POST /api/config and POST /api/reboot. There's no auth on
- * this UI yet (design/ROADMAP.md item 1), so the SoftAP subnet *is* the
+ * this UI yet (design/ROADMAP.md item 1), so the downlink's subnet *is* the
  * authorization boundary: enforce it explicitly rather than relying on the
  * mesh being friendly.
  *
- * Fails closed. If the SoftAP netif is missing or has no address, nothing is
- * on its subnet anyway, so there is no client this could lock out. */
+ * s_cfg->allow_uplink_management additionally accepts this node's own
+ * uplink subnet - an explicit per-node opt-in (see gw_config.h), off by
+ * default, because accepting it trades away this exact protection for
+ * whatever network the uplink joins. */
 static bool request_is_local(httpd_req_t *req)
 {
-    if (s_softap_netif == NULL) {
-        return false;
-    }
-
-    esp_netif_ip_info_t ip_info;
-    if (esp_netif_get_ip_info(s_softap_netif, &ip_info) != ESP_OK || ip_info.ip.addr == 0) {
-        return false;
-    }
-
     uint32_t peer_addr;
     if (!peer_ipv4(req, &peer_addr)) {
         return false;
     }
 
-    return (peer_addr & ip_info.netmask.addr) == (ip_info.ip.addr & ip_info.netmask.addr);
+    if (netif_owns_peer(s_softap_netif, peer_addr)) {
+        return true;
+    }
+
+    return s_cfg != NULL && s_cfg->allow_uplink_management && netif_owns_peer(uplink_netif(), peer_addr);
 }
 
-/* The request's Host header must be the SoftAP's own address. This is the
- * anti-DNS-rebinding half of the interim CSRF defence (see reject_if_remote
- * below): a rebinding attack resolves an attacker's hostname to this device's
- * address, so the browser's requests are same-origin from its own point of
- * view and arrive here with full local-peer credentials - but carrying
- * Host: attacker.example, which is the one part of the request the attacker
- * cannot forge away.
- *
- * Fails closed on a missing or oversized Host header (HTTP/1.1 requires one;
- * every browser and curl sends it). If mDNS or a captive-portal hostname is
- * ever added (ROADMAP item 4), this check must learn those names too or the
- * UI becomes unreachable through them. */
-static bool host_is_self(httpd_req_t *req)
+/* Does the request's Host header name netif's own address? Shared by
+ * host_is_self() below for whichever netif(s) request_is_local() accepted
+ * this request on. */
+static bool host_matches_netif(httpd_req_t *req, esp_netif_t *netif)
 {
-    if (s_softap_netif == NULL) {
+    if (netif == NULL) {
         return false;
     }
 
     esp_netif_ip_info_t ip_info;
-    if (esp_netif_get_ip_info(s_softap_netif, &ip_info) != ESP_OK || ip_info.ip.addr == 0) {
+    if (esp_netif_get_ip_info(netif, &ip_info) != ESP_OK || ip_info.ip.addr == 0) {
         return false;
     }
 
@@ -148,14 +161,39 @@ static bool host_is_self(httpd_req_t *req)
     return host[self_len] == '\0' || host[self_len] == ':';
 }
 
+/* The request's Host header must name whichever of this node's own
+ * addresses it actually arrived on. This is the anti-DNS-rebinding half of
+ * the interim CSRF defence (see reject_if_remote below): a rebinding attack
+ * resolves an attacker's hostname to this device's address, so the
+ * browser's requests are same-origin from its own point of view and arrive
+ * here with full local-peer credentials - but carrying Host:
+ * attacker.example, which is the one part of the request the attacker
+ * cannot forge away.
+ *
+ * Checks the downlink first, then (only when allow_uplink_management is on)
+ * the uplink - same pair request_is_local() checks, so a request accepted by
+ * one can't be rejected here just because it arrived on the other. Fails
+ * closed on a missing or oversized Host header (HTTP/1.1 requires one; every
+ * browser and curl sends it). If mDNS or a captive-portal hostname is ever
+ * added (ROADMAP item 4), this check must learn those names too or the UI
+ * becomes unreachable through them. */
+static bool host_is_self(httpd_req_t *req)
+{
+    if (host_matches_netif(req, s_softap_netif)) {
+        return true;
+    }
+    return s_cfg != NULL && s_cfg->allow_uplink_management && host_matches_netif(req, uplink_netif());
+}
+
 /* Guard for every handler. Returns true if the request should be refused,
  * having already sent the error response.
  *
- * Checks two independent things: the peer must be on the SoftAP subnet
- * (authorization boundary while there's no auth), and the Host header must
- * name this device (anti-DNS-rebinding, see host_is_self). Both are interim
- * hardening, not authentication - a hostile client on the SoftAP can still
- * do everything the UI can until ROADMAP item 1 lands. */
+ * Checks two independent things: the peer must be on the downlink's subnet,
+ * or the uplink's when allow_uplink_management is on (authorization boundary
+ * while there's no auth), and the Host header must name this device
+ * (anti-DNS-rebinding, see host_is_self). Both are interim hardening, not
+ * authentication - a hostile client on either accepted network can still do
+ * everything the UI can until ROADMAP item 1 lands. */
 static bool reject_if_remote(httpd_req_t *req)
 {
     if (request_is_local(req)) {
@@ -164,7 +202,17 @@ static bool reject_if_remote(httpd_req_t *req)
         }
         ESP_LOGW(TAG, "refused %s with a foreign Host header", req->uri);
     } else {
-        ESP_LOGW(TAG, "refused %s from outside the SoftAP subnet", req->uri);
+        /* The peer's address, not just the URI: "outside the subnet" is
+         * meaningless to whoever's reading this back without it, and it's
+         * the first thing this exact class of report needs (2026-08-30 -
+         * confirmed on real hardware that "unreachable" here can mean either
+         * a genuine bug or simply a client on a third network that merely
+         * routes to an accepted one, which the operator can't always tell
+         * apart from the browser side). */
+        uint32_t peer_addr;
+        esp_ip4_addr_t peer_ip = { .addr = peer_ipv4(req, &peer_addr) ? peer_addr : 0 };
+        ESP_LOGW(TAG, "refused %s from outside the authorized subnet(s) (peer " IPSTR ")", req->uri,
+                 IP2STR(&peer_ip));
     }
     httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "config is only reachable from the local Wi-Fi");
     return true;
@@ -235,6 +283,7 @@ static esp_err_t config_get_handler(httpd_req_t *req)
     provisioning_config_lock();
     cJSON_AddStringToObject(root, "node_id", s_cfg->node_id);
     cJSON_AddStringToObject(root, "role", provisioning_role_name(s_cfg->role));
+    cJSON_AddBoolToObject(root, "allow_uplink_management", s_cfg->allow_uplink_management);
 
     cJSON *uplink = cJSON_AddObjectToObject(root, "uplink");
     cJSON_AddStringToObject(uplink, "ssid", s_cfg->uplink.ssid);
@@ -387,6 +436,9 @@ static esp_err_t status_get_handler(httpd_req_t *req)
      * "we called it", not confirmation the AP is actually on air. See
      * downlink_halow_ap.h. */
     cJSON_AddBoolToObject(halow_ap, "started", downlink_halow_ap_is_started());
+    /* Unlike "started" above, this *is* proof the AP is on air - see
+     * downlink_halow_ap_get_sta_count()'s own comment. */
+    cJSON_AddNumberToObject(halow_ap, "connected_clients", downlink_halow_ap_get_sta_count());
     add_netif_ip(halow_ap, "ip", downlink_halow_ap_get_netif());
 
     cJSON *sys = cJSON_AddObjectToObject(root, "system");
@@ -497,6 +549,11 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     const cJSON *role = cJSON_GetObjectItemCaseSensitive(root, "role");
     if (cJSON_IsString(role) && role->valuestring != NULL) {
         work.role = provisioning_parse_role(role->valuestring);
+    }
+
+    const cJSON *allow_uplink_mgmt = cJSON_GetObjectItemCaseSensitive(root, "allow_uplink_management");
+    if (cJSON_IsBool(allow_uplink_mgmt)) {
+        work.allow_uplink_management = cJSON_IsTrue(allow_uplink_mgmt);
     }
 
     const cJSON *uplink = cJSON_GetObjectItemCaseSensitive(root, "uplink");

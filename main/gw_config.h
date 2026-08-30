@@ -47,7 +47,10 @@ extern "C" {
  * AP-mode config - see design/ROADMAP.md items 8 for why. Existing fields are
  * unchanged in layout and meaning, but the struct grew, so a v3 blob must be
  * discarded rather than reinterpreted with garbage tail bytes. */
-#define GW_CONFIG_VERSION 4u
+/* v5: adds `allow_uplink_management`, off by default - see its own comment
+ * below. Existing fields are unchanged; the struct grew, so a v4 blob must be
+ * discarded rather than reinterpreted with a garbage trailing byte. */
+#define GW_CONFIG_VERSION 5u
 
 /* Which pair of radio roles this node runs. Selects the entire bring-up path
  * in app_main.c - the two are mutually exclusive because both would-be uses
@@ -223,6 +226,23 @@ typedef struct {
 
     char node_id[GW_NODE_ID_MAX_LEN + 1];
     gw_node_role_t role; /* GW_ROLE_CLIENT or GW_ROLE_RELAY - see the enum above */
+
+    /* Off by default. reject_if_remote() (main/web_ui.c) treats a request as
+     * authorized only if it arrives on this node's downlink - the SoftAP for
+     * GW_ROLE_CLIENT, the HaLow AP for GW_ROLE_RELAY - because there is still
+     * no real authentication, so network position is the only thing standing
+     * between the config UI and anyone who reaches it. A GW_ROLE_RELAY node
+     * runs no SoftAP of its own, so once it has joined its Wi-Fi uplink and
+     * an operator isn't in HaLow range with a second radio, that boundary
+     * also cuts off the only path back in.
+     *
+     * Turning this on makes reject_if_remote() also accept requests arriving
+     * on this node's own uplink (HaLow STA for GW_ROLE_CLIENT, native Wi-Fi
+     * STA for GW_ROLE_RELAY) - an explicit, per-node trade an operator makes
+     * for a specific deployment (e.g. a relay's own Pi AP they already
+     * trust), not a default: it extends the unauthenticated config UI to
+     * whatever network that uplink joins, mesh included. */
+    bool allow_uplink_management;
     gw_uplink_config_t uplink;             /* GW_ROLE_CLIENT: HaLow STA uplink */
     gw_softap_config_t softap;             /* GW_ROLE_CLIENT: local 2.4GHz SoftAP */
     gw_wifi_uplink_config_t wifi_uplink;   /* GW_ROLE_RELAY: 2.4GHz STA uplink to the Pi */

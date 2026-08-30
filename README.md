@@ -121,14 +121,43 @@ idf.py -p <PORT> flash monitor
 The `morsemicro/halow` component is pulled automatically from the ESP Component Registry via
 `main/idf_component.yml` on first build.
 
+### Editing in PlatformIO (VS Code)
+
+`platformio.ini` is checked in so the PlatformIO VS Code extension gives real IntelliSense
+(accurate per-file includes/defines from `compile_commands.json`) across the whole tree,
+including the vendored `morsemicro/halow` component. First run downloads
+`espressif32@6.12.0` (ESP-IDF 5.5.0 plus its own toolchain) into `~/.platformio` - no separate
+ESP-IDF install needed for this, and it's self-contained per machine, so the same
+`platformio.ini` works unmodified on any PC with the extension (or the `pio` CLI) installed.
+
+**`pio run` cannot fully build this project - use it for editing/navigation only, and keep using
+`idf.py build`/`idf.py flash` above (what CI verifies) for real firmware.** PlatformIO's ESP-IDF
+integration doesn't run CMake's own build graph - it reads CMake's configure-time output, then
+recompiles everything itself via SCons - so any `add_custom_command()`/`target_add_binary_data()`
+step never executes under `pio run`. `pio_embed_generated_binaries.py` (a `pre:` extra_script)
+replicates the two mechanical, well-understood instances of that this project has (the minified
+web UI, and the HaLow firmware/BCF blobs) precisely so IntelliSense sees those files too, but the
+`morselib` component goes further - it merges two archives with `ar -M` and then runs Morse's own
+`librarymangler.py` to rename internal symbols against a protected list (almost certainly to keep
+their vendored hostap/wpa_supplicant fork's symbols from colliding with ESP-IDF's own
+`esp_wifi`/`wpa_supplicant`). Replicating *that* without matching it exactly risks a binary that
+links and flashes but has silently wrong radio-stack symbols - worse than the clean build failure
+`pio run` gives today - so it's deliberately left alone. `pio run` fails at
+`Generating project linker script .pio/build/xiao_esp32s3/sections.ld` for this reason; that's
+expected.
+
 ## Configuring a node
 
 Config (uplink SSID/PSK/security, local SoftAP SSID/PSK/subnet, node id, CoT multicast
-group/port) is stored in NVS, not hardcoded. On first boot it falls back to placeholder defaults
-(open uplink, `xiao-gateway` SoftAP on `172.16.50.0/24`). Two ways to change it, both writing to
-the same config - use whichever's convenient:
+group/port) is stored in NVS, not hardcoded. On first boot (or after a factory reset) it falls back
+to placeholder defaults - open uplink, SoftAP on `172.16.50.0/24` named `xiao-gateway-xxxx`, node id
+`xiao-gw-xxxx`, where `xxxx` is four hex characters from that specific chip's factory-burned MAC
+address (`esp_efuse_mac_get_default()`), not a value stored anywhere. Every unit gets a different,
+stable `xxxx` out of the box - scan for Wi-Fi networks to find it, or read it off the serial console
+(`gwcfg-show`) or the boot log - so multiple factory-fresh nodes never show up as the same AP. Two
+ways to change either default, both writing to the same config - use whichever's convenient:
 
-**Web UI** (no cable needed): connect to the device's own Wi-Fi (`xiao-gateway` /
+**Web UI** (no cable needed): connect to the device's own Wi-Fi (`xiao-gateway-xxxx` /
 `openmanet` by default), then browse to `http://172.16.50.1/`. Passwords are never shown back to
 you - leave a password field blank to keep its current value.
 
@@ -175,7 +204,7 @@ the relay-only fields before switching `role` - and you should, because once a n
 its local SoftAP goes away and it stops being a network anything can just join.
 
 On the node that will become the relay, while still connected to its default SoftAP
-(`xiao-gateway` / `openmanet`) at `http://172.16.50.1/`:
+(`xiao-gateway-xxxx` / `openmanet`) at `http://172.16.50.1/`:
 
 1. Fill in the Wi-Fi uplink section (SSID/password of whatever AP it'll join) and the HaLow AP
    section (SSID/security/passphrase/op-class/channel). Get legal (op-class, channel) values for

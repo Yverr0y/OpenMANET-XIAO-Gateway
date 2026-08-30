@@ -105,9 +105,24 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
     if (base == WIFI_EVENT) {
         switch (id) {
         case WIFI_EVENT_STA_START:
+            /* esp_wifi_connect() used to be called directly from here - the
+             * one heavy call left on this handler's path, inconsistent with
+             * schedule_reconnect() below deferring the exact same call to
+             * wifi_reconnect_task for exactly this reason (see that task's
+             * own history in app_main.c's datapath_task() comment: an
+             * esp_event handler that does real work runs on "sys_evt",
+             * shared with every other event consumer in the system, on a
+             * stack sized by CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE - 2304
+             * bytes at v5.5.1's default, which this project does not
+             * override). Deferred the same way now: wifi_reconnect_task's
+             * own s_associated check is false here (the STA has just
+             * started, not yet connected), so this always proceeds to call
+             * esp_wifi_connect() there, off this handler's stack. */
             s_backoff_ms = RECONNECT_BACKOFF_MIN_MS;
             s_associating = true;
-            esp_wifi_connect();
+            if (s_reconnect_task != NULL) {
+                xTaskNotifyGive(s_reconnect_task);
+            }
             break;
         case WIFI_EVENT_STA_CONNECTED:
             s_associated = true;

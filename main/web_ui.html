@@ -592,58 +592,115 @@
 
   <!-- TAB 1: OVERVIEW / DASHBOARD -->
   <section id="tab-overview" class="tab-pane active" role="tabpanel">
-    
-    <!-- Uplink Status Card -->
-    <div class="hud-card">
-      <div class="card-header">
-        <span class="card-title">Mesh Uplink Link</span>
-        <span id="stUplinkType" class="badge badge-muted">HaLow STA</span>
+
+    <!-- GW_ROLE_CLIENT cards: HaLow STA uplink + local 2.4GHz SoftAP -->
+    <div id="overviewClient">
+      <div class="hud-card">
+        <div class="card-header">
+          <span class="card-title">Mesh Uplink Link</span>
+          <span id="stUplinkType" class="badge badge-muted">HaLow STA</span>
+        </div>
+        <div class="metrics-grid">
+          <div class="metric-item">
+            <span class="stat-label">Link State</span>
+            <span class="stat-value"><span id="dotUplink" class="dot"></span><span id="stUplink">Connecting…</span></span>
+          </div>
+          <div class="metric-item">
+            <span class="stat-label">Signal (RSSI)</span>
+            <span class="stat-value">
+              <span id="stRssi">&mdash;</span>
+              <span id="stRssiMeter" class="signal-meter" aria-hidden="true"><span></span><span></span><span></span><span></span></span>
+            </span>
+          </div>
+          <div class="metric-item">
+            <span class="stat-label">Uplink IP</span>
+            <span class="stat-value" id="stUplinkIp">&mdash;</span>
+          </div>
+          <div class="metric-item">
+            <span class="stat-label">Regulatory Domain</span>
+            <span class="stat-value" id="stRegionDomain">US (902-928MHz)</span>
+          </div>
+        </div>
       </div>
-      <div class="metrics-grid">
-        <div class="metric-item">
-          <span class="stat-label">Link State</span>
-          <span class="stat-value"><span id="dotUplink" class="dot"></span><span id="stUplink">Connecting…</span></span>
+
+      <div class="hud-card">
+        <div class="card-header">
+          <span class="card-title">Local Access Point</span>
+          <span id="stApType" class="badge badge-muted">2.4GHz SoftAP</span>
         </div>
-        <div class="metric-item">
-          <span class="stat-label">Signal (RSSI)</span>
-          <span class="stat-value">
-            <span id="stRssi">&mdash;</span>
-            <span id="stRssiMeter" class="signal-meter" aria-hidden="true"><span></span><span></span><span></span><span></span></span>
-          </span>
-        </div>
-        <div class="metric-item">
-          <span class="stat-label">Uplink IP</span>
-          <span class="stat-value" id="stUplinkIp">&mdash;</span>
-        </div>
-        <div class="metric-item">
-          <span class="stat-label">Regulatory Domain</span>
-          <span class="stat-value" id="stRegionDomain">US (902-928MHz)</span>
+        <div class="metrics-grid">
+          <div class="metric-item">
+            <span class="stat-label">Local IP (Gateway)</span>
+            <span class="stat-value" id="stApIp">&mdash;</span>
+          </div>
+          <div class="metric-item">
+            <span class="stat-label">Connected Clients</span>
+            <span class="stat-value" id="stClients">&mdash;</span>
+          </div>
+          <div class="metric-item">
+            <span class="stat-label">ATAK CoT Relay</span>
+            <span class="stat-value"><span id="dotCot" class="dot"></span><span id="stCot">&mdash;</span></span>
+          </div>
+          <div class="metric-item">
+            <span class="stat-label">NAT Forwarding</span>
+            <span class="stat-value" id="stNatStatus">Enabled</span>
+          </div>
         </div>
       </div>
     </div>
 
-    <!-- Downlink AP Card -->
-    <div class="hud-card">
-      <div class="card-header">
-        <span class="card-title">Local Access Point</span>
-        <span id="stApType" class="badge badge-muted">2.4GHz SoftAP</span>
+    <!-- GW_ROLE_RELAY cards: native Wi-Fi STA uplink to the Pi + HaLow AP downlink for leaf XIAOs -->
+    <div id="overviewRelay" hidden>
+      <div class="hud-card">
+        <div class="card-header">
+          <span class="card-title">Wi-Fi Uplink Link</span>
+          <span class="badge badge-muted">2.4GHz STA</span>
+        </div>
+        <div class="metrics-grid">
+          <div class="metric-item">
+            <span class="stat-label">Link State</span>
+            <span class="stat-value"><span id="dotWifiUplink" class="dot"></span><span id="stWifiUplink">Connecting…</span></span>
+          </div>
+          <div class="metric-item">
+            <span class="stat-label">Signal (RSSI)</span>
+            <span class="stat-value">
+              <span id="stWifiRssi">&mdash;</span>
+              <span id="stWifiRssiMeter" class="signal-meter" aria-hidden="true"><span></span><span></span><span></span><span></span></span>
+            </span>
+          </div>
+          <div class="metric-item">
+            <span class="stat-label">Uplink IP</span>
+            <span class="stat-value" id="stWifiUplinkIp">&mdash;</span>
+          </div>
+          <div class="metric-item">
+            <span class="stat-label">ATAK CoT Relay</span>
+            <span class="stat-value"><span id="dotCotRelay" class="dot"></span><span id="stCotRelay">&mdash;</span></span>
+          </div>
+        </div>
       </div>
-      <div class="metrics-grid">
-        <div class="metric-item">
-          <span class="stat-label">Local IP (Gateway)</span>
-          <span class="stat-value" id="stApIp">&mdash;</span>
+
+      <div class="hud-card">
+        <div class="card-header">
+          <span class="card-title">HaLow AP Downlink</span>
+          <span class="badge badge-accent">Long Range 900MHz</span>
         </div>
-        <div class="metric-item">
-          <span class="stat-label">Connected Clients</span>
-          <span class="stat-value" id="stClients">&mdash;</span>
-        </div>
-        <div class="metric-item">
-          <span class="stat-label">ATAK CoT Relay</span>
-          <span class="stat-value"><span id="dotCot" class="dot"></span><span id="stCot">&mdash;</span></span>
-        </div>
-        <div class="metric-item">
-          <span class="stat-label">NAT Forwarding</span>
-          <span class="stat-value" id="stNatStatus">Enabled</span>
+        <div class="metrics-grid">
+          <div class="metric-item">
+            <span class="stat-label">Radio State</span>
+            <span class="stat-value"><span id="dotHalowAp" class="dot"></span><span id="stHalowAp">&mdash;</span></span>
+          </div>
+          <div class="metric-item">
+            <span class="stat-label">Local IP (Gateway)</span>
+            <span class="stat-value" id="stHalowApIp">&mdash;</span>
+          </div>
+          <div class="metric-item">
+            <span class="stat-label">Associated Leaf XIAOs</span>
+            <span class="stat-value" id="stHalowApClients">&mdash;</span>
+          </div>
+          <div class="metric-item">
+            <span class="stat-label">Regulatory Domain</span>
+            <span class="stat-value" id="stRegionDomainRelay">US (902-928MHz)</span>
+          </div>
         </div>
       </div>
     </div>
@@ -696,6 +753,17 @@
       </div>
       <input type="hidden" id="node_role" value="client">
       <p class="hint">Role changes dictate which physical radios come up. Requires a reboot to apply.</p>
+
+      <label class="checkbox">
+        <input type="checkbox" id="allow_uplink_management"> Allow management from this node's uplink
+      </label>
+      <p class="hint">
+        Off by default: this config UI is only reachable from clients connected directly to this
+        node (its 2.4GHz SoftAP, or a relay's HaLow AP). Turning this on also allows it from
+        whatever network this node's own uplink joins - useful once a relay has left its own
+        SoftAP behind and is only reachable that way, but only enable it for an uplink network you
+        trust: there is still no login on this page itself.
+      </p>
     </div>
 
     <!-- Client Role Fields -->
@@ -979,8 +1047,8 @@ function setDot(id, up) {
   if (d) d.className = 'dot ' + (up ? 'up' : 'down');
 }
 
-function updateRssiMeter(rssi) {
-  var meter = el('stRssiMeter');
+function updateRssiMeter(rssi, meterId) {
+  var meter = el(meterId || 'stRssiMeter');
   if (!meter) return;
   meter.className = 'signal-meter';
   if (typeof rssi !== 'number' || rssi === -999) return;
@@ -1051,25 +1119,50 @@ async function loadStatus() {
 
     el('hdrNode').textContent = s.node_id || 'xiao-gw';
 
-    var u = s.uplink || {};
-    var up = !!u.connected;
-    setDot('dotUplink', up);
-    el('stUplink').textContent = u.state || (up ? 'Connected' : 'Down');
-    el('setupBanner').hidden = (u.configured !== false);
-    
-    var rssiVal = (typeof u.rssi === 'number') ? (u.rssi + ' dBm') : '—';
-    el('stRssi').textContent = rssiVal;
-    updateRssiMeter(u.rssi);
+    var isRelay = s.role === 'relay';
+    el('overviewClient').hidden = isRelay;
+    el('overviewRelay').hidden = !isRelay;
 
-    el('stUplinkIp').textContent = u.ip || 'no lease';
-    el('stApIp').textContent = (s.softap && s.softap.ip) || (s.halow_ap && s.halow_ap.ip) || '—';
+    if (isRelay) {
+      var wu = s.wifi_uplink || {};
+      var wup = !!wu.connected;
+      setDot('dotWifiUplink', wup);
+      el('stWifiUplink').textContent = wu.state || (wup ? 'Connected' : 'Down');
+      el('stWifiRssi').textContent = (typeof wu.rssi === 'number') ? (wu.rssi + ' dBm') : '—';
+      updateRssiMeter(wu.rssi, 'stWifiRssiMeter');
+      el('stWifiUplinkIp').textContent = wu.ip || 'no lease';
 
-    var c = s.softap ? s.softap.clients : -1;
-    el('stClients').textContent = (c < 0) ? 'n/a' : (String(c) + ' device' + (c === 1 ? '' : 's'));
+      var ha = s.halow_ap || {};
+      setDot('dotHalowAp', !!ha.ready);
+      el('stHalowAp').textContent = ha.started ? 'AP started' : (ha.ready ? 'radio up, AP not started' : 'not ready');
+      el('stHalowApIp').textContent = ha.ip || '—';
+      var hc = (typeof ha.connected_clients === 'number') ? ha.connected_clients : -1;
+      el('stHalowApClients').textContent = (hc < 0) ? 'n/a' : (String(hc) + ' XIAO' + (hc === 1 ? '' : 's'));
 
-    var cot = !!(s.cot && s.cot.running);
-    setDot('dotCot', cot);
-    el('stCot').textContent = cot ? (s.cot.group + ':' + s.cot.port) : (up ? 'Stopped' : 'Waiting');
+      var cotR = !!(s.cot && s.cot.running);
+      setDot('dotCotRelay', cotR);
+      el('stCotRelay').textContent = cotR ? (s.cot.group + ':' + s.cot.port) : (wup ? 'Stopped' : 'Waiting');
+    } else {
+      var u = s.uplink || {};
+      var up = !!u.connected;
+      setDot('dotUplink', up);
+      el('stUplink').textContent = u.state || (up ? 'Connected' : 'Down');
+      el('setupBanner').hidden = (u.configured !== false);
+
+      var rssiVal = (typeof u.rssi === 'number') ? (u.rssi + ' dBm') : '—';
+      el('stRssi').textContent = rssiVal;
+      updateRssiMeter(u.rssi, 'stRssiMeter');
+
+      el('stUplinkIp').textContent = u.ip || 'no lease';
+      el('stApIp').textContent = (s.softap && s.softap.ip) || '—';
+
+      var c = s.softap ? s.softap.clients : -1;
+      el('stClients').textContent = (c < 0) ? 'n/a' : (String(c) + ' device' + (c === 1 ? '' : 's'));
+
+      var cot = !!(s.cot && s.cot.running);
+      setDot('dotCot', cot);
+      el('stCot').textContent = cot ? (s.cot.group + ':' + s.cot.port) : (up ? 'Stopped' : 'Waiting');
+    }
 
     if (s.system) {
       el('stUptime').textContent = fmtUptime(s.system.uptime_s);
@@ -1078,11 +1171,16 @@ async function loadStatus() {
       el('hdrVerBadge').textContent = s.system.version ? ('v' + s.system.version.substring(0, 7)) : 'v—';
       el('stPartition').textContent = s.system.partition || 'ota_0';
       el('stRegionDomain').textContent = (s.system.country || 'US') + ' (902-928MHz)';
+      el('stRegionDomainRelay').textContent = (s.system.country || 'US') + ' (902-928MHz)';
     }
   } catch (e) {
     setDot('dotUplink', false);
     setDot('dotCot', false);
+    setDot('dotWifiUplink', false);
+    setDot('dotHalowAp', false);
+    setDot('dotCotRelay', false);
     el('stUplink').textContent = 'unreachable';
+    el('stWifiUplink').textContent = 'unreachable';
   }
 }
 
@@ -1217,6 +1315,7 @@ async function loadConfig() {
     var cfg = await res.json();
     el('node_id').value = cfg.node_id || '';
     setRole(cfg.role || 'client');
+    el('allow_uplink_management').checked = !!cfg.allow_uplink_management;
 
     el('uplink_ssid').value = (cfg.uplink && cfg.uplink.ssid) || '';
     el('uplink_security').value = (cfg.uplink && cfg.uplink.security) || 'open';
@@ -1257,6 +1356,7 @@ async function saveConfig() {
   var body = {
     node_id: el('node_id').value,
     role: el('node_role').value,
+    allow_uplink_management: el('allow_uplink_management').checked,
     uplink: {
       ssid: el('uplink_ssid').value,
       security: el('uplink_security').value,
