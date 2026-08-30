@@ -796,6 +796,10 @@ static int cmd_gwcfg_status(int argc, char **argv)
     printf("cot relay     : %s\n", cot_relay_is_running() ? "running" : "not started");
     printf("country code  : %s (build-time, not settable here)\n", CONFIG_HALOW_COUNTRY_CODE);
     printf("free heap     : %u bytes\n", (unsigned)esp_get_free_heap_size());
+    /* Internal SRAM alone - see heap_guard.h for why this is worth printing
+     * separately from the line above once CONFIG_SPIRAM_USE_MALLOC=y makes
+     * that figure a combined internal+PSRAM number. */
+    printf("free heap (internal): %u bytes\n", (unsigned)esp_get_free_internal_heap_size());
     return 0;
 }
 

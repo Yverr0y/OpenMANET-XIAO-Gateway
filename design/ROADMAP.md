@@ -19,8 +19,10 @@ FGH100M-H — 902–928 MHz, US only.** One build, `CONFIG_HALOW_COUNTRY_CODE="U
 decisions" and [`HARDWARE.md`](HARDWARE.md) "Regulatory domain".
 
 `idf.py build` **passes end-to-end** against ESP-IDF v5.5.1 with the real `morsemicro/halow`
-component: **zero errors, zero warnings**, binary **~1.75 MB (`0x1c02e0`)**, **42% free** in the
+component: **zero errors, zero warnings**, binary **~1.77 MB (`0x1c6100`)**, **41% free** in the
 3 MB app slot on confirmed 8 MB flash. Verified by actually running the build, not by reading code.
+(The 1% drop from PSRAM init code + `heap_guard.c` - see "What's implemented" below - is noise
+next to the margin this slot has.)
 
 That is 182,464 bytes (178 KB, 9.1%) smaller than the ~1.92 MB / 36% this sat at through the
 GW_ROLE_RELAY work, from two changes measured together on one build: `-Os` instead of ESP-IDF's
@@ -98,6 +100,7 @@ callback, check which task will run it and what stack that task has.
 | Stack headroom | `main/task_stats.c` | Worst-case free stack per task via `uxTaskGetStackHighWaterMark()`, surfaced as `gwcfg-tasks` and `GET /api/tasks`. Turns "is this close to overflowing?" into a number - see "Stack budgets" below. |
 | Log ring buffer | `main/log_buffer.c` | `esp_log_set_vprintf` tee into a 6 KB RAM ring, served at `/api/log`. Chains to the previous handler, so serial output is unaffected. |
 | Chip temperature | `main/chip_temp.c` | ESP32-S3 internal die temp via `esp_driver_tsens`, installed once at boot (20-100°C range) and read on each `/api/status` request; surfaced in the web UI's Hardware & Diagnostics card, colored as a warning at ≥80°C. **The HaLow module has no equivalent** — the vendored Morse Micro SDK (`mmwlan.h`/`mmhal_wlan.h`/`mmhal_app.h`/`mmosal.h`) exposes no thermal API for the MM6108/FGH100M-H at all, so its temperature isn't software-readable without external sensor hardware. **`temperature_sensor_install()` confirmed on real hardware 2026-08-30** (`Range [20C ~ 100C], error < 2` logged on boot) on both the relay and the leaf; `/api/status`'s `chip_temp_c` itself not yet checked over the network. |
+| Memory headroom: PSRAM + heap guard | `sdkconfig.defaults`, `main/heap_guard.c` / `.h` | Added 2026-08-30 after tracing lwIP's `PBUF_POOL` type: under ESP-IDF's `MEMP_MEM_MALLOC=1`/`MEM_LIBC_MALLOC=1` (`components/lwip/port/include/lwipopts.h`), it's not a fixed-size pool at all - every pbuf is a plain heap `malloc()`, shared unmodified across every netif and consumer (SoftAP, HaLow, the CoT relay, the web UI/auth's TCP). On this board that heap was internal SRAM alone (~512 KB, no PSRAM) with `CONFIG_LWIP_STATS` off, so a burst on any one interface could starve every other one silently. Two changes: (1) `sdkconfig.defaults` now enables the on-module 8 MB octal PSRAM (`CONFIG_SPIRAM`) with `CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y`, so lwIP/WiFi allocations that don't fit in internal SRAM spill into PSRAM instead of failing - small allocations (under `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL`'s 16 KB default, which covers every pbuf this firmware ever allocates) still prefer fast internal SRAM first. (2) `heap_guard.c` samples combined free heap every 5s and, below `GW_HEAP_COT_SHED_BYTES`, has `cot_relay.c`'s relay task drop-and-count datagrams instead of forwarding them (CoT is UDP/best-effort and the highest-volume consumer; the web UI's TCP/auth traffic is low-volume and human-facing, so it's protected first); below the lower `GW_HEAP_NODE_SHED_BYTES` it also pauses the SoftAP's DHCP server so no new phone associates onto an already-degraded node. Both thresholds and both heap figures (combined + internal-only) are surfaced in `/api/status`. **Confirmed on real hardware 2026-08-30**, both the relay and the leaf: boots cleanly, all stored config (role, uplink SSID, HaLow AP SSID/channel) survives the flash unchanged, both radios stay up (Wi-Fi uplink, HaLow AP with its leaf still associated). Combined free heap jumped from ~135KB/~157KB (pre-PSRAM baseline, measured on the previously-flashed build) to **~8.39MB/~8.41MB** on both nodes - PSRAM is live. Free *internal* SRAM alone reads ~109KB (relay) / ~130KB (leaf), close to each node's pre-flash combined figure as expected, confirming `GW_HEAP_COT_SHED_BYTES`/`GW_HEAP_NODE_SHED_BYTES` (64KB/32KB) sit at a plausible fraction of real headroom rather than an arbitrary guess - though still not yet exercised under an actual traffic burst. |
 | App wiring | `main/app_main.c` | Brings up log buffer, LED, factory-reset watcher, console and web UI immediately; then one of two role-specific bring-up paths (`bring_up_client_role()` / `bring_up_relay_role()`). NAT + CoT relay come up via a shared helper once whichever uplink holds a usable IP, retrying on the next reconnect if that fails. |
 | Web flasher + CI | `docs/`, `.github/workflows/` | ESP Web Tools page, single US build. GitHub Actions builds `sdkconfig.defaults` unmodified and deploys to Pages; PRs build but don't deploy. |
 
@@ -753,6 +756,53 @@ one is confirmed to exist (`PI_SIDE.md` item 0) and compare. A real RSSI there w
 specific to two Morse radios talking to each other with one side in the (alpha) software AP-mode
 role; a flat `0` there too would mean the gap is broader - in the STA-side RX RSSI capture itself,
 regardless of what's on the other end.
+
+#### Sixth Aug 30 finding: a relay's 8 MHz HaLow AP shows as *two* scan entries on a leaf, neither at 8 MHz - almost certainly expected, not a bug
+
+Raised as a live question during the memory-headroom work above: a relay's HaLow AP configured at
+`op_class 4, s1g_chan_num 12` (908.000 MHz, 8 MHz - confirmed via `gwcfg-show` on the relay) was
+scanned from its associated leaf with `gwcfg-scan`, expecting one entry near 908 MHz / 8 MHz.
+Instead, twice, on two different firmware builds (before and after the PSRAM/heap-guard flash
+above - fully reproducible, not intermittent):
+
+```
+SSID                             BSSID                  RSSI         FREQ  BW
+d3MOUS-relay                     f6:ab:5c:df:41:15     0 dBm   904.500 MHz   1 MHz
+d3MOUS-relay                     f6:ab:5c:df:41:15     0 dBm   905.000 MHz   2 MHz
+```
+
+**Read against the vendored SDK's own S1G Operation element struct**
+(`managed_components/morsemicro__halow/.../umac/ies/s1g_operation.h`), this is consistent with
+legitimate 802.11ah behaviour, not a driver fault: a wide (≥4 MHz) operating channel is required to
+also advertise narrower **primary channels** for discovery, and the struct carries both a
+`primary_channel_width_mhz`/`primary_channel_number` pair *and* a separate
+`primary_1mhz_channel_loc` field - i.e. the standard expects a wide AP to expose *both* a primary
+1 MHz sub-channel and a primary 2 MHz sub-channel, not just one. `mmwlan_scan_result.channel_freq_hz`/
+`bw_mhz` are documented as "the channel where the frame was received" (`mmwlan.h`), not the AP's
+operating channel - so a client legitimately reports the AP at wherever its Probe Response actually
+landed. Cross-checked against the real US regdb table (`mmregdb.c` L319-369): 904.500 MHz/1 MHz and
+905.000 MHz/2 MHz are both real, exact table entries, and both frequencies fall inside the AP's
+actual 904-912 MHz (908 MHz ± 4 MHz) 8 MHz span - not off in unrelated spectrum.
+
+**Not yet 100% certain**, because the *contents* of the S1G Operation element weren't parsed - only
+inferred from which frequencies scan reported. Full certainty would mean parsing the raw IE
+(`mmwlan_scan_result.ies`/`ies_len` - already app-visible, public API) directly against the S1G
+Operation element's known byte layout, without depending on morselib's own private
+`ie_s1g_operation_parse()` (unexported outside its own translation unit, and the build already
+name-mangles this vendored library - see "Creating mangled libmorse" in the build log - so its
+availability at link time isn't guaranteed either). Deferred rather than built speculatively: the
+frequency/bandwidth evidence above already converges strongly enough that this is treated as
+resolved-by-inference for now; revisit only if it turns out to matter for a real decision.
+
+**What's still a real, separate, tracked bug**: both entries read `RSSI 0 dBm` - the exact
+"Second Aug 30 finding" flat-RSSI issue below, reproduced again here on both firmware builds. This
+finding doesn't touch that one; they just share a scan.
+
+One operational note from the same session: running `gwcfg-scan` from an already-associated leaf
+knocked its own uplink association loose (`HaLow uplink dropped, will reassociate` immediately
+after the scan printed results) both times. Not investigated further here - filed as a "scanning
+while associated has a cost" observation, not a bug report, since the leaf's own reconnect logic
+recovered on its own both times.
 
 ### 9. Persistent log storage and expanded config — scoping notes (2026-08-30)
 

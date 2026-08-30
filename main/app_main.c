@@ -21,6 +21,7 @@
 #include "downlink_softap.h"
 #include "factory_reset.h"
 #include "gw_config.h"
+#include "heap_guard.h"
 #include "ip_forward_nat.h"
 #include "link_history.h"
 #include "log_buffer.h"
@@ -671,6 +672,15 @@ void app_main(void)
         bring_up_relay_role(&s_cfg);
     } else {
         bring_up_client_role(&s_cfg);
+    }
+
+    /* After the role branch above, not alongside chip_temp_init()/
+     * link_history_init(): unlike those two, this needs the SoftAP netif
+     * bring_up_client_role() -> downlink_softap_init() just created (NULL on
+     * GW_ROLE_RELAY, which runs no SoftAP - see heap_guard.h). */
+    err = heap_guard_init(s_cfg.role == GW_ROLE_RELAY ? NULL : downlink_softap_get_netif());
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "heap guard init failed: %s", esp_err_to_name(err));
     }
 
     const esp_app_desc_t *desc = esp_app_get_description();

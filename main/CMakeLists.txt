@@ -17,6 +17,7 @@ idf_component_register(
         "link_history.c"
         "auth.c"
         "dns_forward.c"
+        "heap_guard.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_wifi

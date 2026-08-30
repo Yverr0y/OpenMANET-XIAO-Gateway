@@ -10,6 +10,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "heap_guard.h"
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
 #include "task_stats.h"
@@ -207,6 +208,16 @@ static void relay_task(void *arg)
 
         if (forward_to == NULL) {
             continue; /* arrived via neither known interface - drop rather than guess */
+        }
+
+        /* Heap under pressure: shed CoT (UDP/best-effort, and the highest-
+         * volume consumer of lwIP's shared pbuf pool) before the low-volume,
+         * human-facing web UI/auth TCP traffic starves instead - see
+         * heap_guard.h. Checked here rather than before parsing IP_PKTINFO so
+         * the counters below still mean exactly what cot_relay.h documents:
+         * "received on this netif and forwarded out the other one". */
+        if (heap_guard_should_shed_cot()) {
+            continue;
         }
 
         /* Unlocked: relay_task is the only writer of rx_packets/rx_bytes, and

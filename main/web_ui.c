@@ -9,6 +9,7 @@
 #include "chip_temp.h"
 #include "cot_relay.h"
 #include "downlink_halow_ap.h"
+#include "heap_guard.h"
 #include "link_history.h"
 #include "log_buffer.h"
 #include "provisioning.h"
@@ -548,8 +549,19 @@ static esp_err_t status_get_handler(httpd_req_t *req)
 
     cJSON *sys = cJSON_AddObjectToObject(root, "system");
     cJSON_AddNumberToObject(sys, "uptime_s", (double)(esp_timer_get_time() / 1000000));
-    cJSON_AddNumberToObject(sys, "heap_free", esp_get_free_heap_size());
-    cJSON_AddNumberToObject(sys, "heap_min", esp_get_minimum_free_heap_size());
+    uint32_t heap_free, heap_min, heap_free_internal;
+    heap_guard_get_stats(&heap_free, &heap_min, &heap_free_internal);
+    cJSON_AddNumberToObject(sys, "heap_free", heap_free);
+    cJSON_AddNumberToObject(sys, "heap_min", heap_min);
+    /* Free *internal* SRAM alone - see heap_guard.h. Worth its own field
+     * because CONFIG_SPIRAM_USE_MALLOC=y makes heap_free/heap_min above a
+     * combined internal+PSRAM figure that can look healthy while internal
+     * SRAM (which DMA descriptors and task stacks are pinned to) is actually
+     * tight. */
+    cJSON_AddNumberToObject(sys, "heap_free_internal", heap_free_internal);
+    /* Whether the CoT relay is currently dropping datagrams under heap
+     * pressure rather than forwarding them - see GW_HEAP_COT_SHED_BYTES. */
+    cJSON_AddBoolToObject(sys, "cot_relay_shed_active", heap_guard_should_shed_cot());
     /* ESP32-S3 die temperature, not the HaLow module's - see chip_temp.h for
      * why the latter isn't readable at all. Null (rather than a fabricated
      * number) when the sensor never initialized or a read fails. */

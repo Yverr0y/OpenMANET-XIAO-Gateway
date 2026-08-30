@@ -144,6 +144,45 @@ CONFIG_HALOW_PS_MODE=n
 # from Kconfig (halow/mmhalow.c L191).
 CONFIG_HALOW_COUNTRY_CODE="US"
 
+# --- PSRAM: this board's ESP32-S3 module carries 8MB octal PSRAM on-module
+# (design/HARDWARE.md's BOM: "flash, octal PSRAM, USB" committed on-module) -
+# but CONFIG_SPIRAM defaults to "n" (components/esp_psram/esp32s3/Kconfig.spiram
+# L1-3 at v5.5.1), so every byte this firmware has used until now came from the
+# ESP32-S3's ~512KB of internal SRAM alone, with lwIP's shared pbuf pool
+# (main/cot_relay.h's cot_relay_counters_t comment) drawing from that same
+# heap as everything else - SoftAP, the web UI, NAT, HaLow.
+#
+# CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y (components/esp_psram/Kconfig.spiram.common
+# L101-106) is the specific knob that lets WiFi/lwIP allocations spill into
+# PSRAM - it defaults to "n" even with CONFIG_SPIRAM=y alone, so turning on
+# PSRAM support by itself would not touch this problem. Paired with
+# CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL's own default (16384 bytes, same file
+# L88-97, left unset here): allocations under 16KB - which covers every pbuf
+# and socket buffer this firmware ever allocates, all comfortably under the
+# CoT relay's 1500-byte rx_buffer - still *prefer* fast internal SRAM first,
+# and only spill into the 8MB PSRAM pool once internal SRAM is exhausted
+# ("If allocation from the preferred region fails, an attempt is made to
+# allocate from the non-preferred region instead, so malloc() will not
+# suddenly fail when either internal or external memory is full" - same doc
+# comment). That's the "fast reserved pool with overflow capacity" behavior
+# old router buffer pools hand-implement, for free from ESP-IDF's allocator.
+#
+# Octal mode (CONFIG_SPIRAM_MODE_OCT) because the on-module part is Octal
+# PSRAM, not Quad. 80MHz clock (CONFIG_SPIRAM_SPEED_80M) rather than the
+# 40MHz default: 80MHz is the documented ceiling for Octal mode without
+# opting into experimental 120MHz support - not worth that risk on a
+# stability-first build.
+#
+# Hardware re-validation note, same as -Os below: PSRAM initialization
+# happens very early in boot and a failure there looks identical to other
+# early-boot faults - re-confirm checklist steps 1 and 4 on real hardware
+# before trusting this.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+
 # --- Partition table: the default single-app table only allows a 1MB app
 # partition, but this firmware (HaLow SDK + softAP + NAT + CoT relay +
 # console + web UI) doesn't fit - a real `idf.py build` failed with "app

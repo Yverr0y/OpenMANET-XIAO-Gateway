@@ -325,6 +325,45 @@ change: `mmhalow_init()` reads it straight from Kconfig ([`halow/mmhalow.c`][hal
 match the domain the Pi's HaLow radio runs, or the two radios never find each other even though
 both work perfectly.
 
+### Channel bandwidth: prefer 1–2 MHz over 4–8 MHz
+
+Bandwidth (the `bw_mhz` half of an (op_class, s1g_chan_num) pair - `gwcfg-list-halow-channels`,
+or the web UI's HaLow AP channel dropdown on a GW_ROLE_RELAY node) is chosen per deployment, not
+fixed at build time like the region above. Default to the narrow end of what's legal, not the
+wide end, for two reasons specific to this project.
+
+**The regdb itself already shows the shape of the tradeoff.** Reading the actual US channel table
+(`managed_components/morsemicro__halow/components/mm-iot-sdk/framework/src/mmregdb/mmregdb.c`
+L319-369) rather than assuming it:
+
+| Bandwidth | Channels available in 902–928 MHz |
+|---|---|
+| 1 MHz | 26 |
+| 2 MHz | 12 |
+| 4 MHz | 6 |
+| 8 MHz | 3 |
+
+(No 16 MHz entries exist in this domain at all — 8 MHz is the real ceiling, matching the "32.5 Mbps
+max PHY" figure in the BOM table above, which is the 8 MHz/MCS9 number.) Splitting the same 26 MHz
+of spectrum into narrower channels concentrates the same transmit power (36 dBm EIRP across every
+row in that table — bandwidth doesn't buy you more of it) into less spectrum, which is what
+improves receiver sensitivity and link margin: the same physics that makes LoRa and other
+long-range sub-GHz radios favor narrow channels over throughput. For ATAK CoT traffic - small,
+periodic position/status messages, not bulk data - there is throughput to spare at 1 MHz. More
+available channels (26 vs. 3) also makes channel planning across a multi-node OpenMANET deployment
+meaningfully easier as the mesh grows past one hop.
+
+**It also compounds with this project's memory headroom, not independently of it.** lwIP's pbuf
+allocations are shared, unreserved heap across every netif and consumer on this device (see
+`main/heap_guard.h` and the "Memory headroom: PSRAM + heap guard" row in
+[`ROADMAP.md`](ROADMAP.md)'s "What's implemented"). A wider channel raises the ceiling on how fast
+the radio can hand packets to lwIP in a burst, which raises the ceiling on how big that burst can
+get before `heap_guard.c`'s shedding kicks in. Choosing a narrow channel is a second, free layer of
+the same defense - it caps the burst at the source instead of only reacting to it after the fact.
+
+Reserve 4/8 MHz for a short, uncontested hop where the extra throughput is actually usable (e.g. a
+relay sitting a few meters from its Pi) and range/obstruction margin isn't the binding constraint.
+
 ### Why not the other eight regions
 
 An earlier version of this repo built nine regions — US, CA, EU, GB, AU, NZ, JP, KR, IN — on the
