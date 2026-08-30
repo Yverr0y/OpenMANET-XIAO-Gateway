@@ -13,12 +13,16 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include "auth.h"
+#include "chip_temp.h"
 #include "cot_relay.h"
+#include "dns_forward.h"
 #include "downlink_halow_ap.h"
 #include "downlink_softap.h"
 #include "factory_reset.h"
 #include "gw_config.h"
 #include "ip_forward_nat.h"
+#include "link_history.h"
 #include "log_buffer.h"
 #include "provisioning.h"
 #include "status_led.h"
@@ -192,7 +196,7 @@ static bool wait_for_downlink_up(esp_netif_t *downlink_netif)
 }
 
 static void bring_up_datapath(esp_netif_t *downlink_netif, esp_netif_t *uplink_netif,
-                               const gw_cot_config_t *cot)
+                               const gw_cot_config_t *cot, bool is_relay)
 {
     if (s_datapath_up) {
         return;
@@ -227,6 +231,21 @@ static void bring_up_datapath(esp_netif_t *downlink_netif, esp_netif_t *uplink_n
         cot_err = ESP_OK; /* already running from an earlier attempt */
     } else if (cot_err != ESP_OK) {
         ESP_LOGE(TAG, "CoT relay start failed: %s", esp_err_to_name(cot_err));
+    }
+
+    /* GW_ROLE_RELAY only - a leaf's statically-addressed uplink has no DHCP
+     * lease to learn a DNS server from at all (see gw_uplink_config_t.
+     * static_dns's own comment), so this node's own real one (from its own,
+     * normally-DHCP'd uplink) needs to be reachable for leaves to point at.
+     * Not fatal if it fails - same severity as a missing DNS server
+     * anywhere else in this project - NAT/CoT still work without it. */
+    if (is_relay) {
+        esp_err_t dns_err = dns_forward_start(downlink_netif, uplink_netif);
+        if (dns_err == ESP_ERR_INVALID_STATE) {
+            dns_err = ESP_OK; /* already running from an earlier attempt */
+        } else if (dns_err != ESP_OK) {
+            ESP_LOGW(TAG, "DNS forwarder start failed: %s", esp_err_to_name(dns_err));
+        }
     }
 
     if (nat_err == ESP_OK && cot_err == ESP_OK) {
@@ -290,10 +309,10 @@ static void datapath_task(void *arg)
         if (role == GW_ROLE_RELAY) {
             /* Native Wi-Fi STA uplink (to the Pi's local AP), HaLow AP
              * downlink (to leaf XIAOs). */
-            bring_up_datapath(downlink_halow_ap_get_netif(), uplink_wifi_get_netif(), &cot);
+            bring_up_datapath(downlink_halow_ap_get_netif(), uplink_wifi_get_netif(), &cot, true);
         } else {
             /* HaLow STA uplink, local SoftAP downlink. */
-            bring_up_datapath(downlink_softap_get_netif(), uplink_halow_get_netif(), &cot);
+            bring_up_datapath(downlink_softap_get_netif(), uplink_halow_get_netif(), &cot, false);
         }
 
         /* Done means done: give the 4 KB back rather than parking it.
@@ -584,6 +603,17 @@ void app_main(void)
     ESP_ERROR_CHECK(provisioning_init());
     provisioning_load(&s_cfg);
 
+    /* After provisioning_load() so auth.c reads the just-loaded credential
+     * (or its all-zero, password_set==false default) immediately, not a
+     * stale in-memory zero from before NVS was read. Not inside
+     * web_ui_start(): provisioning.c's gwcfg-reset-auth console command (a
+     * sibling module, not a descendant of web_ui.c) needs
+     * auth_drop_all_sessions() too. */
+    err = auth_init(&s_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "auth init failed: %s", esp_err_to_name(err));
+    }
+
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
@@ -594,6 +624,24 @@ void app_main(void)
     err = status_led_start(s_cfg.role);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "status LED start failed: %s", esp_err_to_name(err));
+    }
+
+    /* Independent of role - both a relay and a client sit in the same
+     * enclosure and can run hot. Non-fatal on failure: chip_temp_read_celsius()
+     * then just always reports "no data" to the web UI. */
+    err = chip_temp_init();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "chip temperature sensor init failed: %s", esp_err_to_name(err));
+    }
+
+    /* Also independent of role and started before either uplink exists -
+     * early samples just read INT16_MIN (link_history.c's "no reading yet"
+     * sentinel) until bring_up_client_role()/bring_up_relay_role() below
+     * brings the real uplink up, which is harmless and means the history
+     * naturally covers the whole boot-to-associated window. */
+    err = link_history_init();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "link RSSI history init failed: %s", esp_err_to_name(err));
     }
 
     /* The config-recovery escape hatch. Started early and independently of

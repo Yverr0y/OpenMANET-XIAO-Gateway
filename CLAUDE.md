@@ -26,7 +26,14 @@ firmware that would have failed silently on hardware and looked like radio probl
 
 The same discipline has also *saved* work — a note claiming `mmhalow_disconnect()` didn't exist was
 wrong; fetching the component and reading `mmhalow.h` settled it in minutes. And `esp_http_server`
-has no `HTTPD_503`/`HTTPD_409` members, which would have been compile errors.
+has no `HTTPD_503`/`HTTPD_409` members, which would have been compile errors. Same again for a
+"free" per-netif byte-counter idea (2026-08-30): lwIP's own SNMP MIB2 counters
+(`netif->mib2_counters`, `lwip/snmp.h`) looked like the answer, but `MIB2_STATS` defaults to `0`
+with no ESP-IDF Kconfig knob to enable it, and `esp_netif.h` exposes no accessor for the underlying
+`struct netif *` to flip it from application code anyway (only
+`esp_netif_get_netif_impl_index()`/`_name()`) — reading `esp_netif.h` and `lwip/opt.h` first avoided
+a design built on reaching into private lwIP internals. `main/cot_relay.h`'s
+`cot_relay_counters_t` comment has the full citation.
 
 So: when touching an unfamiliar API, fetch and read it.
 

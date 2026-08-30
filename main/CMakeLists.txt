@@ -13,6 +13,10 @@ idf_component_register(
         "factory_reset.c"
         "log_buffer.c"
         "task_stats.c"
+        "chip_temp.c"
+        "link_history.c"
+        "auth.c"
+        "dns_forward.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_wifi
@@ -33,6 +37,21 @@ idf_component_register(
         # header this component installs exposes the type - it is an
         # implementation detail of app_main.c.
         espcoredump
+        # chip_temp.c's ESP32-S3 die reading (esp_driver_tsens/temperature_sensor.h).
+        # PRIV_ because only chip_temp.c touches the driver header - app_main.c
+        # and web_ui.c go through chip_temp.h's own wrapper.
+        esp_driver_tsens
+        # auth.c's login verification is one mbedtls_md_hmac(SHA256) call over
+        # the stored credential and a nonce - MBEDTLS_MD_C and MBEDTLS_SHA256_C,
+        # both unconditionally compiled into this IDF version (no sdkconfig gate
+        # exists for either - confirmed against
+        # esp-idf/components/mbedtls/port/include/mbedtls/esp_config.h).
+        # PRIV_ because only auth.c includes mbedtls/md.h. Deliberately does NOT
+        # use mbedtls's own PBKDF2 (MBEDTLS_PKCS5_C): the KDF runs client-side
+        # in web_ui.html's bundled JS, so this device only ever verifies one
+        # precomputed HMAC - see design/ROADMAP.md item 1 and auth.c's own
+        # comment for why running PBKDF2 on-device was rejected.
+        mbedtls
 )
 
 # web_ui.html is embedded rather than served from a filesystem, so unlike the C

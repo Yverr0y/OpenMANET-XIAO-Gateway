@@ -43,6 +43,7 @@ static const struct {
     { "console_repl",    CONSOLE_REPL_STACK },
     { "datapath",        GW_STACK_DATAPATH },
     { "cot_relay",       GW_STACK_COT_RELAY },
+    { "dns_forward",     GW_STACK_DNS_FORWARD },
     { "wifi_reconnect",  GW_STACK_WIFI_RECONNECT },
     { "halow_reconnect", GW_STACK_HALOW_RECONNECT },
     { "factory_reset",   GW_STACK_FACTORY_RESET },

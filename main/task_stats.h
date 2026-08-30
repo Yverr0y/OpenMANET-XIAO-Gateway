@@ -23,7 +23,23 @@ extern "C" {
 #define GW_STACK_WIFI_RECONNECT  4096
 #define GW_STACK_HALOW_RECONNECT 4096
 #define GW_STACK_FACTORY_RESET   4096
-#define GW_STACK_WEB_UI          6144
+/* select() over two sockets plus a bounded pending-query table walk -
+ * lighter than cot_relay's own budget (no cJSON, no multi-KB scan buffer),
+ * but matched to it rather than trimmed, same reasoning as every other
+ * socket-handling task here. */
+#define GW_STACK_DNS_FORWARD     4096
+/* 6144 -> 7168 for design/ROADMAP.md item 1's web UI auth: an existing
+ * measurement (see "Stack budgets" below) already showed only ~1648 bytes
+ * free (74% used) under a max-field POST /api/config, before any auth code
+ * existed. The new login/password handlers add one mbedtls_md_hmac(SHA256)
+ * call (small - a context plus two SHA-256 block computations, since the
+ * expensive PBKDF2 loop runs client-side, never on this device - see
+ * auth.c's own comment) plus cookie parsing, hex encode/decode scratch, and
+ * cJSON parsing of new small bodies on top of an already-thin budget.
+ * +1024 is a proactive margin, not a tightly-derived number - re-measure via
+ * gwcfg-tasks/GET /api/tasks under a real login attempt on hardware and
+ * raise again if headroom is still thin. */
+#define GW_STACK_WEB_UI          7168
 
 /* Deliberately the smallest in the firmware: status_led_task() reads an enum
  * and toggles a GPIO. It has no room for a log call, and shouldn't grow one -

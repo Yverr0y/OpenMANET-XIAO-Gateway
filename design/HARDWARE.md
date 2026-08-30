@@ -229,6 +229,33 @@ antenna placement and a third radio's worth of interference to think about, not 
 If PPS isn't needed, D5/GPIO 6 stays free for something else — a battery-sense divider, a second
 status LED, a hardware button.
 
+### Other candidates weighed against the same 3 pads (2026-08-30)
+
+The three free pads (D5/GPIO6, D6/GPIO43, D7/GPIO44) are one shared budget — picking one candidate
+below spends pads the others need:
+
+- **NeoPixel (WS2812) status indicator** — cheapest option, one data pin (any of the three).
+  `esp_driver_rmt` (already in this project's component list via ESP-IDF, not a new dependency)
+  drives the WS2812 bit timing natively; no level shifting needed since the S3's GPIO is 3.3V logic
+  and WS2812 typically accepts it. Doesn't compete with GPS for pads unless GPS also wants all
+  three (TX+RX+PPS) - then something has to give.
+- **Battery voltage sensing** — one ADC-capable pin (D5/GPIO6 is `ADC1_CH5`), a simple divider.
+  Cheap, and independent of whether the node can actually *run* on that battery - see "The HaLow
+  HAT needs the 5V rail, and the battery doesn't feed it" above, which is the real blocker for
+  battery operation and has nothing to do with GPIO budget.
+- **SD card — does not fit the 3-pad budget.** A fresh SPI bus needs 4 signals (SCK/MISO/MOSI/CS);
+  only 3 pads are free for everything. The only path is sharing the HaLow's existing SPI bus
+  (`CONFIG_MM_SPI_SCK`/`_MISO`/`_MOSI`, GPIO 7/8/9) and spending one free pad as a second device's
+  CS line - the ESP32-S3 SPI peripheral supports multiple devices with separate CS lines on one
+  bus in principle (`spi_bus_add_device()`), but **this is untested here and the interaction with
+  Morse Micro's own SPI driver's bus-scheduling assumptions is an open question, not a documented
+  fact** - the HaLow driver's transactions are IRQ-driven and latency-sensitive; whether it yields
+  the bus cleanly to a second, slower device (SD init typically starts at ~400kHz) needs to be
+  proven on a bench before it's trusted, not assumed from "SPI supports multiple slaves."
+  If the actual need is more log/config storage rather than literally an SD card, the ~1.81MB
+  unallocated past the dual-OTA partitions (see `ROADMAP.md`'s OTA section) gets there with a
+  SPIFFS/FAT partition and zero GPIO cost - see `ROADMAP.md` item 9.
+
 ## Assembly
 
 1. **Seat the WM6108 on the XIAO ESP32-S3.** The two boards share the XIAO footprint. Check the

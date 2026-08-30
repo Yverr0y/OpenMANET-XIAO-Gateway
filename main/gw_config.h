@@ -50,7 +50,17 @@ extern "C" {
 /* v5: adds `allow_uplink_management`, off by default - see its own comment
  * below. Existing fields are unchanged; the struct grew, so a v4 blob must be
  * discarded rather than reinterpreted with a garbage trailing byte. */
-#define GW_CONFIG_VERSION 5u
+/* v6: adds `auth` (gw_auth_config_t) for design/ROADMAP.md item 1's web UI
+ * credential. A v5 blob is discarded (grown struct, not safely
+ * reinterpretable) rather than migrated - it comes back with
+ * auth.password_set == false, which is exactly the forced-first-use state
+ * anyway, so no migration code is needed. */
+/* v7: adds `gw_uplink_config_t.static_dns` - see its own comment. Existing
+ * fields unchanged; a v6 blob is discarded rather than reinterpreted, which
+ * comes back with static_dns empty - the same "no DNS configured" state a
+ * static-IP uplink has always silently had, just now a real field instead
+ * of an unreachable one. */
+#define GW_CONFIG_VERSION 7u
 
 /* Which pair of radio roles this node runs. Selects the entire bring-up path
  * in app_main.c - the two are mutually exclusive because both would-be uses
@@ -120,6 +130,31 @@ typedef struct {
     char static_ip[GW_IP4_STR_MAX_LEN];
     char static_gateway[GW_IP4_STR_MAX_LEN];
     char static_netmask[GW_IP4_STR_MAX_LEN];
+
+    /* Empty means "no DNS server configured" - the pre-existing, still-valid
+     * state for a leaf whose uplink is a real Pi under normal DHCP (that
+     * case never reaches this field at all - see uplink_halow.c's
+     * apply_static_ip(), only called when use_static_ip is set).
+     *
+     * A statically-addressed uplink has no DHCP lease to learn a DNS server
+     * from at all, so without this field ip_forward_nat.c's propagate_dns()
+     * always finds nothing to offer downstream clients - confirmed on real
+     * hardware 2026-08-30 (design/ROADMAP.md), where it silently broke every
+     * hostname lookup for a phone behind a leaf, while raw IP (including the
+     * leaf's own web UI) kept working, which looked exactly like "no
+     * internet" rather than "no DNS".
+     *
+     * For a leaf associating to a GW_ROLE_RELAY node's HaLow AP, this should
+     * be set to that relay's own downlink address (gw_halow_ap_config_t.ip,
+     * e.g. 172.16.60.1) - main/dns_forward.c runs a small forwarder there
+     * that relays queries out through the relay's own uplink, using
+     * whatever real DNS server *that* hop actually has (learned via DHCP,
+     * same as this project's existing DNS-propagation logic already trusts
+     * for a GW_ROLE_CLIENT node's SoftAP). This is deliberately not a
+     * hardcoded public resolver: it stays correct if the relay's own
+     * upstream network's DNS server ever changes, with no reprovisioning of
+     * every leaf. */
+    char static_dns[GW_IP4_STR_MAX_LEN];
 } gw_uplink_config_t;
 
 typedef struct {
@@ -218,6 +253,27 @@ typedef struct {
     uint16_t port;                  /* e.g. 6969 */
 } gw_cot_config_t;
 
+/* An admin credential for the web UI (design/ROADMAP.md item 1). Never the
+ * plaintext password - stored_key is PBKDF2-HMAC-SHA256(password, salt,
+ * iterations, 32), computed client-side in web_ui.html's bundled crypto.
+ * main/auth.c only ever verifies against stored_key with one HMAC-SHA256
+ * call; it never derives a key and never sees the plaintext password. */
+typedef struct {
+    /* Explicit rather than derived from stored_key being non-zero: an
+     * all-zero PBKDF2 output is a theoretically valid hash, and conflating
+     * it with "unset" would be a real bug - unlike gw_uplink_is_configured()'s
+     * SSID-derived flag above, there's no other field here "unset" can
+     * safely mean. */
+    bool password_set;
+    uint8_t salt[16];       /* esp_random(), regenerated on every password set/change */
+    uint32_t iterations;    /* PBKDF2 round count used for *this* credential - stored
+                              * per-credential rather than assumed to equal auth.c's
+                              * current default, so raising (or lowering, if the chosen
+                              * default proves too slow on real phones) the constant
+                              * later doesn't strand already-provisioned devices */
+    uint8_t stored_key[32]; /* PBKDF2-HMAC-SHA256 output - see this struct's own comment */
+} gw_auth_config_t;
+
 typedef struct {
     /* Must stay first and must not change type - provisioning_load() reads
      * these before trusting anything after them. */
@@ -248,6 +304,7 @@ typedef struct {
     gw_wifi_uplink_config_t wifi_uplink;   /* GW_ROLE_RELAY: 2.4GHz STA uplink to the Pi */
     gw_halow_ap_config_t halow_ap;         /* GW_ROLE_RELAY: HaLow AP downlink */
     gw_cot_config_t cot;
+    gw_auth_config_t auth;                 /* web UI admin credential - see its own comment */
 } gw_config_t;
 
 #ifdef __cplusplus

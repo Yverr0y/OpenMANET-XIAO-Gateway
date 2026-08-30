@@ -5,8 +5,11 @@
 
 #include "web_ui.h"
 
+#include "auth.h"
+#include "chip_temp.h"
 #include "cot_relay.h"
 #include "downlink_halow_ap.h"
+#include "link_history.h"
 #include "log_buffer.h"
 #include "provisioning.h"
 #include "task_stats.h"
@@ -30,6 +33,13 @@ extern const char web_ui_html_start[] asm("_binary_web_ui_html_start");
 extern const char web_ui_html_end[] asm("_binary_web_ui_html_end");
 
 #define POST_BODY_MAX 1024
+
+/* The new auth endpoints' request bodies are a couple of fixed-length hex
+ * strings each - far smaller than POST_BODY_MAX, but its own bound so a
+ * malformed/oversized body is rejected before ever reaching cJSON_Parse(). */
+#define AUTH_BODY_MAX 256
+
+#define AUTH_COOKIE_NAME "gwsess"
 
 /* Long enough for the JSON response to be written to the socket and read by
  * the browser before the CPU resets underneath it. */
@@ -239,6 +249,82 @@ static bool reject_if_not_json(httpd_req_t *req)
     return true;
 }
 
+/* Third member of the guard trio, after reject_if_remote/reject_if_not_json
+ * (design/ROADMAP.md item 1). Defends against a different attacker than
+ * either of those: someone already on the accepted subnet with the right
+ * Host header - i.e. a teammate who has the Wi-Fi passphrase but shouldn't
+ * be an administrator. The frontend only ever reads the status code here,
+ * never a body, so a plain httpd_resp_send_err() is correct - unlike the new
+ * auth endpoints below, which return structured JSON on failure and
+ * therefore can't use it - see this file's other new comment on why. */
+static bool auth_require_session(httpd_req_t *req)
+{
+    char token[AUTH_TOKEN_HEX_LEN + 1];
+    size_t len = sizeof(token);
+    if (httpd_req_get_cookie_val(req, AUTH_COOKIE_NAME, token, &len) == ESP_OK &&
+        auth_check_session(token)) {
+        return false;
+    }
+    ESP_LOGW(TAG, "refused %s without a valid session", req->uri);
+    httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "login required");
+    return true;
+}
+
+/* httpd_resp_send_err() always wraps its message in an HTML error page
+ * (confirmed against esp_http_server.h) - fine for the plain-text guard
+ * rejections above, wrong for anything the frontend needs to JSON.parse(),
+ * like a lockout's retry_after_s. There is also no 429 or 409 member in
+ * httpd_err_code_t (confirmed by reading it directly - the same gap this
+ * project already hit for HTTPD_503/HTTPD_409, see CLAUDE.md), so a custom
+ * status line has to go through httpd_resp_set_status() instead, which takes
+ * an arbitrary string. This is the one shared helper every new auth endpoint
+ * error path below uses instead of httpd_resp_send_err() - takes ownership
+ * of body (always deletes it) and serializes it the same way every other
+ * handler in this file already does, just with an optional custom status
+ * line set first. */
+static esp_err_t send_auth_json(httpd_req_t *req, const char *status, cJSON *body)
+{
+    if (body == NULL) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
+        return ESP_FAIL;
+    }
+    if (status != NULL) {
+        httpd_resp_set_status(req, status);
+    }
+    char *out = cJSON_PrintUnformatted(body);
+    cJSON_Delete(body);
+    if (out == NULL) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    esp_err_t err = httpd_resp_sendstr(req, out);
+    free(out);
+    return err;
+}
+
+static cJSON *make_auth_error(const char *error_code)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (root != NULL) {
+        cJSON_AddStringToObject(root, "error", error_code);
+    }
+    return root;
+}
+
+/* Sets the session cookie. httpd_resp_set_hdr() stores the pointer verbatim,
+ * not a copy (see root_get_handler's own comment on the same function below)
+ * - cookie_buf must stay in scope until the handler's httpd_resp_send*()
+ * call actually flushes headers, i.e. callers build this on their own stack
+ * and must not return or reuse the buffer before sending the response. */
+static void set_session_cookie(httpd_req_t *req, char *cookie_buf, size_t cookie_buf_size,
+                                const char *token_hex)
+{
+    snprintf(cookie_buf, cookie_buf_size,
+             "%s=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=43200", AUTH_COOKIE_NAME, token_hex);
+    httpd_resp_set_hdr(req, "Set-Cookie", cookie_buf);
+}
+
 static esp_err_t root_get_handler(httpd_req_t *req)
 {
     if (reject_if_remote(req)) {
@@ -270,7 +356,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 
 static esp_err_t config_get_handler(httpd_req_t *req)
 {
-    if (reject_if_remote(req)) {
+    if (reject_if_remote(req) || auth_require_session(req)) {
         return ESP_FAIL;
     }
 
@@ -294,6 +380,7 @@ static esp_err_t config_get_handler(httpd_req_t *req)
     cJSON_AddStringToObject(uplink, "static_ip", s_cfg->uplink.static_ip);
     cJSON_AddStringToObject(uplink, "static_gateway", s_cfg->uplink.static_gateway);
     cJSON_AddStringToObject(uplink, "static_netmask", s_cfg->uplink.static_netmask);
+    cJSON_AddStringToObject(uplink, "static_dns", s_cfg->uplink.static_dns);
 
     cJSON *softap = cJSON_AddObjectToObject(root, "softap");
     cJSON_AddStringToObject(softap, "ssid", s_cfg->softap.ssid);
@@ -351,7 +438,7 @@ static void add_netif_ip(cJSON *parent, const char *name, esp_netif_t *netif)
  * like every other handler. */
 static esp_err_t status_get_handler(httpd_req_t *req)
 {
-    if (reject_if_remote(req)) {
+    if (reject_if_remote(req) || auth_require_session(req)) {
         return ESP_FAIL;
     }
 
@@ -371,6 +458,24 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     provisioning_config_unlock();
 
     cJSON_AddBoolToObject(cot, "running", cot_relay_is_running());
+
+    /* Not a generic per-netif traffic counter - see cot_relay_counters_t's
+     * own doc comment for why that isn't available through public ESP-IDF
+     * API. This counts the CoT payload itself moving through the one
+     * datapath this project fully owns, which is the traffic this project
+     * actually exists to move. */
+    cot_relay_counters_t cot_uplink_counters, cot_downlink_counters;
+    cot_relay_get_counters(&cot_uplink_counters, &cot_downlink_counters);
+    cJSON *cot_up = cJSON_AddObjectToObject(cot, "uplink_side");
+    cJSON_AddNumberToObject(cot_up, "rx_packets", cot_uplink_counters.rx_packets);
+    cJSON_AddNumberToObject(cot_up, "rx_bytes", (double)cot_uplink_counters.rx_bytes);
+    cJSON_AddNumberToObject(cot_up, "tx_packets", cot_uplink_counters.tx_packets);
+    cJSON_AddNumberToObject(cot_up, "tx_bytes", (double)cot_uplink_counters.tx_bytes);
+    cJSON *cot_down = cJSON_AddObjectToObject(cot, "downlink_side");
+    cJSON_AddNumberToObject(cot_down, "rx_packets", cot_downlink_counters.rx_packets);
+    cJSON_AddNumberToObject(cot_down, "rx_bytes", (double)cot_downlink_counters.rx_bytes);
+    cJSON_AddNumberToObject(cot_down, "tx_packets", cot_downlink_counters.tx_packets);
+    cJSON_AddNumberToObject(cot_down, "tx_bytes", (double)cot_downlink_counters.tx_bytes);
 
     cJSON *uplink = cJSON_AddObjectToObject(root, "uplink");
     /* "connected" tracks the DHCP lease, not raw 802.11 association - the
@@ -445,6 +550,15 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(sys, "uptime_s", (double)(esp_timer_get_time() / 1000000));
     cJSON_AddNumberToObject(sys, "heap_free", esp_get_free_heap_size());
     cJSON_AddNumberToObject(sys, "heap_min", esp_get_minimum_free_heap_size());
+    /* ESP32-S3 die temperature, not the HaLow module's - see chip_temp.h for
+     * why the latter isn't readable at all. Null (rather than a fabricated
+     * number) when the sensor never initialized or a read fails. */
+    float chip_celsius;
+    if (chip_temp_read_celsius(&chip_celsius)) {
+        cJSON_AddNumberToObject(sys, "chip_temp_c", chip_celsius);
+    } else {
+        cJSON_AddNullToObject(sys, "chip_temp_c");
+    }
     /* Build-time regulatory domain. Worth surfacing because it cannot be
      * changed at runtime and a mismatch with the mesh Pi is the failure that
      * blocks association outright (design/PI_SIDE.md item 3). */
@@ -491,7 +605,7 @@ static void copy_json_str(const cJSON *parent, const char *key, char *out, size_
 
 static esp_err_t config_post_handler(httpd_req_t *req)
 {
-    if (reject_if_remote(req) || reject_if_not_json(req)) {
+    if (reject_if_remote(req) || reject_if_not_json(req) || auth_require_session(req)) {
         return ESP_FAIL;
     }
 
@@ -580,6 +694,10 @@ static esp_err_t config_post_handler(httpd_req_t *req)
         if (!too_long) {
             copy_json_str(uplink, "static_netmask", work.uplink.static_netmask,
                           sizeof(work.uplink.static_netmask), &too_long);
+        }
+        if (!too_long) {
+            copy_json_str(uplink, "static_dns", work.uplink.static_dns,
+                          sizeof(work.uplink.static_dns), &too_long);
         }
     }
 
@@ -690,7 +808,7 @@ static esp_err_t config_post_handler(httpd_req_t *req)
  * one, and that must stay true. */
 static esp_err_t log_get_handler(httpd_req_t *req)
 {
-    if (reject_if_remote(req)) {
+    if (reject_if_remote(req) || auth_require_session(req)) {
         return ESP_FAIL;
     }
 
@@ -747,7 +865,7 @@ static void scan_result_cb(const uplink_scan_result_t *result, void *ctx)
  */
 static esp_err_t scan_post_handler(httpd_req_t *req)
 {
-    if (reject_if_remote(req) || reject_if_not_json(req)) {
+    if (reject_if_remote(req) || reject_if_not_json(req) || auth_require_session(req)) {
         return ESP_FAIL;
     }
 
@@ -813,7 +931,7 @@ static void channel_collect_cb(const halow_ap_channel_t *chan, void *ctx)
  * regulatory domain (US 902-928MHz) so the web UI can populate channel dropdowns. */
 static esp_err_t channels_get_handler(httpd_req_t *req)
 {
-    if (reject_if_remote(req)) {
+    if (reject_if_remote(req) || auth_require_session(req)) {
         return ESP_FAIL;
     }
 
@@ -872,7 +990,7 @@ static void task_stack_collect_cb(const task_stack_info_t *info, void *ctx)
  * case for anything deployed - see design/ROADMAP.md item 8. */
 static esp_err_t tasks_get_handler(httpd_req_t *req)
 {
-    if (reject_if_remote(req)) {
+    if (reject_if_remote(req) || auth_require_session(req)) {
         return ESP_FAIL;
     }
 
@@ -899,6 +1017,54 @@ static esp_err_t tasks_get_handler(httpd_req_t *req)
     return err;
 }
 
+/* Separate endpoint rather than another /api/status field: at
+ * LINK_HISTORY_SAMPLES entries this is heavier than the rest of the status
+ * payload combined, and the data only changes once every
+ * LINK_HISTORY_INTERVAL_S seconds - polling it on the same cadence as the
+ * rest of /api/status (a few seconds) would mean re-sending the same numbers
+ * repeatedly for nothing. */
+static esp_err_t rssi_history_get_handler(httpd_req_t *req)
+{
+    if (reject_if_remote(req) || auth_require_session(req)) {
+        return ESP_FAIL;
+    }
+
+    static int16_t samples[LINK_HISTORY_SAMPLES];
+    size_t n = link_history_get_rssi(samples, LINK_HISTORY_SAMPLES);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *array = root ? cJSON_AddArrayToObject(root, "rssi_dbm") : NULL;
+    if (array == NULL) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
+        return ESP_FAIL;
+    }
+    cJSON_AddNumberToObject(root, "interval_s", LINK_HISTORY_INTERVAL_S);
+
+    /* null rather than a sentinel number, same reasoning as every other RSSI
+     * field in this file - a page shouldn't have to know INT16_MIN is the
+     * "no reading" value too. */
+    for (size_t i = 0; i < n; i++) {
+        if (samples[i] == INT16_MIN) {
+            cJSON_AddItemToArray(array, cJSON_CreateNull());
+        } else {
+            cJSON_AddItemToArray(array, cJSON_CreateNumber(samples[i]));
+        }
+    }
+
+    char *out = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (out == NULL) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    esp_err_t err = httpd_resp_sendstr(req, out);
+    free(out);
+    return err;
+}
+
 static void reboot_timer_cb(void *arg)
 {
     (void)arg;
@@ -908,7 +1074,7 @@ static void reboot_timer_cb(void *arg)
 
 static esp_err_t reboot_post_handler(httpd_req_t *req)
 {
-    if (reject_if_remote(req) || reject_if_not_json(req)) {
+    if (reject_if_remote(req) || reject_if_not_json(req) || auth_require_session(req)) {
         return ESP_FAIL;
     }
 
@@ -934,6 +1100,280 @@ static esp_err_t reboot_post_handler(httpd_req_t *req)
     return httpd_resp_sendstr(req, "{\"status\":\"rebooting\"}");
 }
 
+/* ---- Web UI authentication (design/ROADMAP.md item 1) ----
+ *
+ * Six new endpoints implementing the settled challenge-response design:
+ * login against an existing credential, and the first-ever password set (or
+ * a later change) against a server-issued salt. auth.c owns all the
+ * crypto/session/lockout state; everything here is HTTP-layer glue -
+ * cookies, JSON bodies, status codes - exactly the split chip_temp.c and
+ * link_history.c already use to stay independent of esp_http_server.h. */
+
+/* Same shape as config_post_handler's inline body read, generalized since
+ * three small POST bodies below need it - bounded well under POST_BODY_MAX
+ * since a valid body here is one flat object with 1-2 short hex fields. */
+static cJSON *read_auth_json_body(httpd_req_t *req)
+{
+    int total_len = req->content_len;
+    if (total_len <= 0 || total_len >= AUTH_BODY_MAX) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body too large or empty");
+        return NULL;
+    }
+
+    char buf[AUTH_BODY_MAX];
+    int cur_len = 0;
+    while (cur_len < total_len) {
+        int received = httpd_req_recv(req, buf + cur_len, total_len - cur_len);
+        if (received <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "failed to read body");
+            return NULL;
+        }
+        cur_len += received;
+    }
+    buf[total_len] = '\0';
+
+    /* Same defense as config_post_handler's own container-nesting guard,
+     * scaled to what a valid body here actually needs: one flat object, no
+     * arrays and no real nesting at all. */
+    int container_budget = 2;
+    for (const char *p = buf; *p != '\0'; p++) {
+        if ((*p == '{' || *p == '[') && --container_budget < 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "too many nested JSON containers");
+            return NULL;
+        }
+    }
+
+    cJSON *root = cJSON_Parse(buf);
+    if (root == NULL) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid JSON");
+        return NULL;
+    }
+    return root;
+}
+
+/* A required string field of exactly hex_len characters. Unlike
+ * copy_json_str() (whose missing/empty means "leave the current value"),
+ * these fields have no "current value" concept - missing, empty or
+ * wrong-length is simply a bad request. Hex-ness itself is checked by
+ * auth.c's own hex decoder, not here - this only extracts the string. */
+static bool get_json_hex_field(const cJSON *parent, const char *key, char *out, size_t hex_len)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(parent, key);
+    if (!cJSON_IsString(item) || item->valuestring == NULL || strlen(item->valuestring) != hex_len) {
+        return false;
+    }
+    memcpy(out, item->valuestring, hex_len);
+    out[hex_len] = '\0';
+    return true;
+}
+
+static esp_err_t auth_status_get_handler(httpd_req_t *req)
+{
+    if (reject_if_remote(req)) {
+        return ESP_FAIL;
+    }
+
+    char token[AUTH_TOKEN_HEX_LEN + 1];
+    size_t len = sizeof(token);
+    bool authenticated = httpd_req_get_cookie_val(req, AUTH_COOKIE_NAME, token, &len) == ESP_OK &&
+                          auth_check_session(token);
+
+    cJSON *root = cJSON_CreateObject();
+    if (root == NULL) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
+        return ESP_FAIL;
+    }
+    cJSON_AddBoolToObject(root, "password_set", auth_password_is_set());
+    cJSON_AddBoolToObject(root, "authenticated", authenticated);
+    return send_auth_json(req, NULL, root);
+}
+
+static esp_err_t auth_challenge_get_handler(httpd_req_t *req)
+{
+    if (reject_if_remote(req)) {
+        return ESP_FAIL;
+    }
+
+    if (!auth_password_is_set()) {
+        return send_auth_json(req, "409 Conflict", make_auth_error("no_password_set"));
+    }
+
+    uint32_t retry_after_s;
+    if (auth_is_locked_out(&retry_after_s)) {
+        cJSON *body = make_auth_error("locked_out");
+        if (body != NULL) {
+            cJSON_AddNumberToObject(body, "retry_after_s", retry_after_s);
+        }
+        return send_auth_json(req, "429 Too Many Requests", body);
+    }
+
+    char nonce_hex[AUTH_NONCE_HEX_LEN + 1];
+    char salt_hex[AUTH_SALT_HEX_LEN + 1];
+    uint32_t iterations;
+    if (!auth_begin_login_challenge(nonce_hex, salt_hex, &iterations)) {
+        /* Password state changed between the check above and here (e.g. a
+         * concurrent gwcfg-reset-auth) - vanishingly unlikely, but report it
+         * accurately rather than hand out a stale/meaningless challenge. */
+        return send_auth_json(req, "409 Conflict", make_auth_error("no_password_set"));
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    if (root == NULL) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
+        return ESP_FAIL;
+    }
+    cJSON_AddStringToObject(root, "salt", salt_hex);
+    cJSON_AddNumberToObject(root, "iterations", iterations);
+    cJSON_AddStringToObject(root, "nonce", nonce_hex);
+    return send_auth_json(req, NULL, root);
+}
+
+static esp_err_t auth_login_post_handler(httpd_req_t *req)
+{
+    if (reject_if_remote(req) || reject_if_not_json(req)) {
+        return ESP_FAIL;
+    }
+
+    cJSON *body = read_auth_json_body(req);
+    if (body == NULL) {
+        return ESP_FAIL; /* error already sent */
+    }
+
+    char nonce_hex[AUTH_NONCE_HEX_LEN + 1];
+    char response_hex[AUTH_RESPONSE_HEX_LEN + 1];
+    bool ok = get_json_hex_field(body, "nonce", nonce_hex, AUTH_NONCE_HEX_LEN) &&
+              get_json_hex_field(body, "response", response_hex, AUTH_RESPONSE_HEX_LEN);
+    cJSON_Delete(body);
+    if (!ok) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "nonce/response must be present and correctly sized");
+        return ESP_FAIL;
+    }
+
+    char token_hex[AUTH_TOKEN_HEX_LEN + 1];
+    uint32_t retry_after_s;
+    switch (auth_verify_login(nonce_hex, response_hex, token_hex, &retry_after_s)) {
+    case AUTH_LOGIN_OK: {
+        char cookie_buf[96];
+        set_session_cookie(req, cookie_buf, sizeof(cookie_buf), token_hex);
+        cJSON *root = cJSON_CreateObject();
+        if (root != NULL) {
+            cJSON_AddStringToObject(root, "status", "ok");
+        }
+        return send_auth_json(req, NULL, root);
+    }
+    case AUTH_LOGIN_LOCKED_OUT: {
+        cJSON *lockedBody = make_auth_error("locked_out");
+        if (lockedBody != NULL) {
+            cJSON_AddNumberToObject(lockedBody, "retry_after_s", retry_after_s);
+        }
+        return send_auth_json(req, "429 Too Many Requests", lockedBody);
+    }
+    case AUTH_LOGIN_NO_CHALLENGE:
+    case AUTH_LOGIN_BAD_CREDENTIALS:
+    default:
+        /* Never distinguish the two to the client - both are "try again
+         * from a fresh challenge", and telling an attacker "no challenge"
+         * vs "wrong password" leaks which guesses are even worth scoring. */
+        return send_auth_json(req, "401 Unauthorized", make_auth_error("invalid_credentials"));
+    }
+}
+
+static esp_err_t auth_logout_post_handler(httpd_req_t *req)
+{
+    if (reject_if_remote(req) || reject_if_not_json(req)) {
+        return ESP_FAIL;
+    }
+
+    char token[AUTH_TOKEN_HEX_LEN + 1];
+    size_t len = sizeof(token);
+    if (httpd_req_get_cookie_val(req, AUTH_COOKIE_NAME, token, &len) == ESP_OK) {
+        auth_end_session(token);
+    }
+
+    char cookie_buf[64];
+    snprintf(cookie_buf, sizeof(cookie_buf), "%s=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0",
+             AUTH_COOKIE_NAME);
+    httpd_resp_set_hdr(req, "Set-Cookie", cookie_buf);
+
+    cJSON *root = cJSON_CreateObject();
+    if (root != NULL) {
+        cJSON_AddStringToObject(root, "status", "ok");
+    }
+    return send_auth_json(req, NULL, root);
+}
+
+/* Reachable without a session only while no password is set yet (first-use
+ * flow); once one exists, this doubles as the "change password" entry point
+ * and requires one, enforced the same way every functional endpoint already
+ * is - see auth_require_session(). */
+static esp_err_t auth_new_salt_get_handler(httpd_req_t *req)
+{
+    if (reject_if_remote(req)) {
+        return ESP_FAIL;
+    }
+    if (auth_password_is_set() && auth_require_session(req)) {
+        return ESP_FAIL;
+    }
+
+    char salt_hex[AUTH_SALT_HEX_LEN + 1];
+    uint32_t iterations;
+    auth_begin_password_salt(salt_hex, &iterations);
+
+    cJSON *root = cJSON_CreateObject();
+    if (root == NULL) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
+        return ESP_FAIL;
+    }
+    cJSON_AddStringToObject(root, "salt", salt_hex);
+    cJSON_AddNumberToObject(root, "iterations", iterations);
+    return send_auth_json(req, NULL, root);
+}
+
+static esp_err_t auth_password_post_handler(httpd_req_t *req)
+{
+    if (reject_if_remote(req) || reject_if_not_json(req)) {
+        return ESP_FAIL;
+    }
+    if (auth_password_is_set() && auth_require_session(req)) {
+        return ESP_FAIL;
+    }
+
+    cJSON *body = read_auth_json_body(req);
+    if (body == NULL) {
+        return ESP_FAIL; /* error already sent */
+    }
+
+    char stored_key_hex[AUTH_STORED_KEY_HEX_LEN + 1];
+    bool ok = get_json_hex_field(body, "stored_key", stored_key_hex, AUTH_STORED_KEY_HEX_LEN);
+    cJSON_Delete(body);
+    if (!ok) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "stored_key must be present and correctly sized");
+        return ESP_FAIL;
+    }
+
+    char token_hex[AUTH_TOKEN_HEX_LEN + 1];
+    switch (auth_commit_password(stored_key_hex, token_hex)) {
+    case AUTH_SET_OK: {
+        char cookie_buf[96];
+        set_session_cookie(req, cookie_buf, sizeof(cookie_buf), token_hex);
+        cJSON *root = cJSON_CreateObject();
+        if (root != NULL) {
+            cJSON_AddStringToObject(root, "status", "ok");
+        }
+        return send_auth_json(req, NULL, root);
+    }
+    case AUTH_SET_NO_PENDING_SALT:
+        return send_auth_json(req, "409 Conflict", make_auth_error("no_pending_salt"));
+    case AUTH_SET_BAD_KEY:
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "stored_key is not valid hex");
+        return ESP_FAIL;
+    case AUTH_SET_SAVE_FAILED:
+    default:
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to save credential");
+        return ESP_FAIL;
+    }
+}
+
 esp_err_t web_ui_start(gw_config_t *cfg, esp_netif_t *softap_netif)
 {
     if (cfg == NULL) {
@@ -956,9 +1396,9 @@ esp_err_t web_ui_start(gw_config_t *cfg, esp_netif_t *softap_netif)
      * 5s socket timeouts would abort the connection before it can answer. */
     config.recv_wait_timeout = 15;
     config.send_wait_timeout = 15;
-    /* Default is 8 and there are 8 routes below - raised so adding one doesn't
-     * fail registration at runtime instead of at compile time. */
-    config.max_uri_handlers = 12;
+    /* Default is 8 and there are 16 routes below - raised so adding one
+     * doesn't fail registration at runtime instead of at compile time. */
+    config.max_uri_handlers = 18;
     /* The status and scan handlers build and print whole cJSON trees on this
      * stack, on top of the default 4KB. (Scan *results* are delivered from the
      * driver's own task - see uplink_halow.h - but assembling and serializing
@@ -980,8 +1420,15 @@ esp_err_t web_ui_start(gw_config_t *cfg, esp_netif_t *softap_netif)
         { .uri = "/api/config", .method = HTTP_POST, .handler = config_post_handler },
         { .uri = "/api/log", .method = HTTP_GET, .handler = log_get_handler },
         { .uri = "/api/tasks", .method = HTTP_GET, .handler = tasks_get_handler },
+        { .uri = "/api/rssi-history", .method = HTTP_GET, .handler = rssi_history_get_handler },
         { .uri = "/api/scan", .method = HTTP_POST, .handler = scan_post_handler },
         { .uri = "/api/reboot", .method = HTTP_POST, .handler = reboot_post_handler },
+        { .uri = "/api/auth/status", .method = HTTP_GET, .handler = auth_status_get_handler },
+        { .uri = "/api/auth/challenge", .method = HTTP_GET, .handler = auth_challenge_get_handler },
+        { .uri = "/api/auth/login", .method = HTTP_POST, .handler = auth_login_post_handler },
+        { .uri = "/api/auth/logout", .method = HTTP_POST, .handler = auth_logout_post_handler },
+        { .uri = "/api/auth/new-salt", .method = HTTP_GET, .handler = auth_new_salt_get_handler },
+        { .uri = "/api/auth/password", .method = HTTP_POST, .handler = auth_password_post_handler },
     };
 
     for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {

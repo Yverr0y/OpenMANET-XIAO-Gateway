@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "esp_err.h"
 #include "esp_netif.h"
@@ -35,6 +36,29 @@ esp_err_t cot_relay_inject(const void *data, size_t len);
  * after the uplink gets a DHCP lease, so a false here is a normal state
  * early in boot, not necessarily a fault. */
 bool cot_relay_is_running(void);
+
+/* Packets/bytes relayed *through* one side - i.e. received on the other
+ * netif and forwarded out this one, or vice versa. Not a generic per-netif
+ * traffic counter: lwIP's own SNMP MIB2 counters (netif->mib2_counters,
+ * lwip/snmp.h) would give that, but MIB2_STATS defaults to 0 and ESP-IDF's
+ * lwipopts.h (components/lwip/port/include/lwipopts.h) exposes no Kconfig
+ * knob to turn it on, and esp_netif.h has no accessor for the underlying
+ * `struct netif *` to flip it from application code either - only
+ * esp_netif_get_netif_impl_index()/_name(). Counting CoT traffic here
+ * instead measures exactly the payload this project exists to move, using
+ * only code this project owns. */
+typedef struct {
+    uint32_t rx_packets; /* received on this netif and forwarded out the other */
+    uint64_t rx_bytes;
+    uint32_t tx_packets; /* received on the other netif and forwarded out this one */
+    uint64_t tx_bytes;
+} cot_relay_counters_t;
+
+/* Fills *out_uplink and *out_downlink with the counters for the netif_a
+ * ("uplink") and netif_b ("downlink") arguments cot_relay_start() was
+ * called with. All-zero before cot_relay_start() succeeds. Either pointer
+ * may be NULL to skip it. */
+void cot_relay_get_counters(cot_relay_counters_t *out_uplink, cot_relay_counters_t *out_downlink);
 
 #ifdef __cplusplus
 }

@@ -186,13 +186,19 @@ static void ip_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
  * Because that lives in action_connected, it re-runs on every reconnect - the
  * address is reapplied each time the link comes back, with no work here.
  *
- * One real consequence, deliberately not worked around: a static uplink learns
- * no DNS server, and esp_netif_set_ip_info() additionally calls
- * dns_clear_servers(true) on a DHCP-client netif (L1987). ip_forward_nat.c
- * already handles that - propagate_dns() warns and returns ESP_ERR_NOT_FOUND
- * rather than offering clients 0.0.0.0 - so a leaf on this hop gets working IP
- * connectivity and no name resolution. That is the correct trade for a hop
- * whose whole purpose is carrying CoT, which is addressed by IP. */
+ * One real consequence, worked around as of 2026-08-30 (previously
+ * documented here as a deliberate trade - it wasn't, it was a gap that
+ * simply hadn't been exercised by real cross-mesh traffic yet): a static
+ * uplink learns no DNS server on its own, and esp_netif_set_ip_info()
+ * additionally calls dns_clear_servers(true) on a DHCP-client netif
+ * (L1987), so this file must set one explicitly, and only *after*
+ * set_ip_info() or that same call would immediately clear it again.
+ * cfg->static_dns (empty by default - see its own comment in gw_config.h)
+ * is that explicit value; for a leaf on a GW_ROLE_RELAY node's HaLow AP it
+ * should be the relay's own downlink address, where main/dns_forward.c runs
+ * a forwarder using the relay's *own* real upstream DNS server. Left empty,
+ * behavior is unchanged from before: ip_forward_nat.c's propagate_dns()
+ * warns and offers clients no DNS option rather than 0.0.0.0. */
 static esp_err_t apply_static_ip(esp_netif_t *netif, const gw_uplink_config_t *cfg)
 {
     esp_netif_ip_info_t ip_info = { 0 };
@@ -213,8 +219,26 @@ static esp_err_t apply_static_ip(esp_netif_t *netif, const gw_uplink_config_t *c
         return err;
     }
 
-    ESP_LOGI(TAG, "uplink is statically addressed %s/%s via %s - no DHCP client will run",
-             cfg->static_ip, cfg->static_netmask, cfg->static_gateway);
+    if (cfg->static_dns[0] != '\0') {
+        /* Must come after set_ip_info() above - see this function's own
+         * comment on dns_clear_servers(true). */
+        esp_netif_dns_info_t dns_info = { 0 };
+        dns_info.ip.type = ESP_IPADDR_TYPE_V4;
+        dns_info.ip.u_addr.ip4.addr = ipaddr_addr(cfg->static_dns);
+        esp_err_t dns_err = esp_netif_set_dns_info(netif, ESP_NETIF_DNS_MAIN, &dns_info);
+        if (dns_err != ESP_OK) {
+            /* Non-fatal - IP connectivity still works, only name resolution
+             * is affected, same severity ip_forward_nat.c's propagate_dns()
+             * already treats a missing DNS server as. */
+            ESP_LOGW(TAG, "couldn't set the uplink static DNS %s: %s", cfg->static_dns,
+                     esp_err_to_name(dns_err));
+        }
+    }
+
+    ESP_LOGI(TAG, "uplink is statically addressed %s/%s via %s%s%s - no DHCP client will run",
+             cfg->static_ip, cfg->static_netmask, cfg->static_gateway,
+             cfg->static_dns[0] != '\0' ? ", DNS " : "",
+             cfg->static_dns[0] != '\0' ? cfg->static_dns : "");
     return ESP_OK;
 }
 

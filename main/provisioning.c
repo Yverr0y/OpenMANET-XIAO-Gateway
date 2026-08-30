@@ -5,6 +5,7 @@
 
 #include "provisioning.h"
 
+#include "auth.h"
 #include "cot_relay.h"
 #include "downlink_halow_ap.h"
 #include "esp_app_desc.h"
@@ -99,6 +100,7 @@ void provisioning_get_defaults(gw_config_t *cfg)
     cfg->uplink.static_ip[0] = '\0';
     cfg->uplink.static_gateway[0] = '\0';
     cfg->uplink.static_netmask[0] = '\0';
+    cfg->uplink.static_dns[0] = '\0';
 
     /* GW_ROLE_RELAY fields. Also unconfigured by default, same reasoning as
      * the HaLow uplink above - and harmless to leave populated with their
@@ -142,6 +144,12 @@ void provisioning_get_defaults(gw_config_t *cfg)
     /* ATAK CoT multicast group. */
     strlcpy(cfg->cot.group, "239.2.3.1", sizeof(cfg->cot.group));
     cfg->cot.port = 6969;
+
+    /* auth: left all-zero by the memset above. password_set == false is the
+     * correct default - see gw_auth_config_t's own comment - and forces the
+     * first-use password-set flow in web_ui.html rather than shipping a
+     * fixed default credential (a compliance requirement, not a preference -
+     * CA SB-327, UK PSTI - see CLAUDE.md). */
 }
 
 esp_err_t provisioning_init(void)
@@ -300,6 +308,14 @@ esp_err_t provisioning_validate(const gw_config_t *cfg, char *errbuf, size_t err
             GW_REJECT("uplink static netmask '%s' must be a valid, non-zero address",
                       cfg->uplink.static_netmask);
         }
+        /* Unlike the three above, empty is valid here - it means "no DNS
+         * configured", the same state this field has always defaulted to.
+         * Only reject a value that was actually supplied but isn't usable. */
+        if (cfg->uplink.static_dns[0] != '\0' &&
+            (inet_aton(cfg->uplink.static_dns, &addr) == 0 || addr.s_addr == 0)) {
+            GW_REJECT("uplink static DNS '%s' must be empty or a valid, non-zero address",
+                      cfg->uplink.static_dns);
+        }
     }
 
     if (cfg->softap.ssid[0] == '\0') {
@@ -394,6 +410,15 @@ esp_err_t provisioning_validate(const gw_config_t *cfg, char *errbuf, size_t err
         GW_REJECT("CoT port must be 1-65535");
     }
 
+    /* salt/stored_key have no invalid byte patterns to reject - iterations
+     * is the one field that can be silently wrong (e.g. a corrupted or
+     * hand-edited NVS blob) in a way that would make every future login fail
+     * with no clue why, so it's worth catching here rather than at auth.c's
+     * first HMAC attempt. */
+    if (cfg->auth.password_set && cfg->auth.iterations == 0) {
+        GW_REJECT("auth iterations must be nonzero when a password is set");
+    }
+
     return ESP_OK;
 
 #undef GW_REJECT
@@ -449,6 +474,8 @@ static void print_config(const gw_config_t *cfg)
         if (cfg->uplink.use_static_ip) {
             printf("uplink.static_ip: %s/%s via %s\n", cfg->uplink.static_ip, cfg->uplink.static_netmask,
                    cfg->uplink.static_gateway);
+            printf("uplink.static_dns: %s\n",
+                   cfg->uplink.static_dns[0] != '\0' ? cfg->uplink.static_dns : "(none configured)");
         }
         printf("softap.ssid   : %s\n", cfg->softap.ssid);
         printf("softap.channel: %u\n", cfg->softap.channel);
@@ -610,9 +637,12 @@ static int cmd_gwcfg_set_uplink_mgmt(int argc, char **argv)
  * keeping out of the common command's argument list. */
 static int cmd_gwcfg_set_uplink_static_ip(int argc, char **argv)
 {
-    if (!s_cfg || (argc != 2 && argc != 4)) {
+    if (!s_cfg || (argc != 2 && argc != 4 && argc != 5)) {
         printf("usage: gwcfg-set-uplink-static-ip -              (use DHCP, the default)\n"
-               "       gwcfg-set-uplink-static-ip <ip> <gateway> <netmask>\n");
+               "       gwcfg-set-uplink-static-ip <ip> <gateway> <netmask> [dns]\n"
+               "  [dns] matters most when associating to a GW_ROLE_RELAY node's HaLow AP -\n"
+               "  point it at that relay's own downlink address (e.g. 172.16.60.1); the\n"
+               "  relay forwards queries from there using its own real upstream DNS server.\n");
         return 1;
     }
 
@@ -624,15 +654,17 @@ static int cmd_gwcfg_set_uplink_static_ip(int argc, char **argv)
         work.uplink.static_ip[0] = '\0';
         work.uplink.static_gateway[0] = '\0';
         work.uplink.static_netmask[0] = '\0';
-    } else if (argc == 4) {
+        work.uplink.static_dns[0] = '\0';
+    } else if (argc == 4 || argc == 5) {
         work.uplink.use_static_ip = true;
         strlcpy(work.uplink.static_ip, argv[1], sizeof(work.uplink.static_ip));
         strlcpy(work.uplink.static_gateway, argv[2], sizeof(work.uplink.static_gateway));
         strlcpy(work.uplink.static_netmask, argv[3], sizeof(work.uplink.static_netmask));
+        strlcpy(work.uplink.static_dns, argc == 5 ? argv[4] : "", sizeof(work.uplink.static_dns));
     } else {
         provisioning_config_unlock();
         printf("usage: gwcfg-set-uplink-static-ip -              (use DHCP, the default)\n"
-               "       gwcfg-set-uplink-static-ip <ip> <gateway> <netmask>\n");
+               "       gwcfg-set-uplink-static-ip <ip> <gateway> <netmask> [dns]\n");
         return 1;
     }
 
@@ -953,6 +985,33 @@ static int cmd_gwcfg_reset(int argc, char **argv)
     return 0;
 }
 
+/* Deliberately diverges from cmd_gwcfg_reset()'s "edit in RAM, operator runs
+ * gwcfg-save then reboots" convention: this is a physically-present recovery
+ * action for someone locked out right now (design/ROADMAP.md item 1's
+ * settled "Recovery" decision), not a routine config edit. Saving and
+ * dropping sessions immediately means the lockout is actually gone the
+ * moment this command returns, not after a save-then-reboot an operator
+ * might forget mid-recovery. */
+static int cmd_gwcfg_reset_auth(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    if (!s_cfg) {
+        return 1;
+    }
+    provisioning_config_lock();
+    memset(&s_cfg->auth, 0, sizeof(s_cfg->auth)); /* password_set=false - forces first-use flow again */
+    esp_err_t err = provisioning_save(s_cfg);
+    provisioning_config_unlock();
+    auth_drop_all_sessions(); /* immediate effect - no reboot required */
+    if (err == ESP_OK) {
+        printf("auth credential cleared and saved; sessions dropped - no reboot needed\n");
+    } else {
+        printf("failed to save: %s\n", esp_err_to_name(err));
+    }
+    return err == ESP_OK ? 0 : 1;
+}
+
 esp_err_t provisioning_register_console_commands(gw_config_t *cfg)
 {
     s_cfg = cfg;
@@ -969,6 +1028,7 @@ esp_err_t provisioning_register_console_commands(gw_config_t *cfg)
         { .command = "gwcfg-set-halow-ap", .help = "Set the relay role's HaLow AP downlink", .hint = NULL, .func = &cmd_gwcfg_set_halow_ap },
         { .command = "gwcfg-save", .help = "Persist current config to NVS", .hint = NULL, .func = &cmd_gwcfg_save },
         { .command = "gwcfg-reset", .help = "Reset in-RAM config to built-in defaults", .hint = NULL, .func = &cmd_gwcfg_reset },
+        { .command = "gwcfg-reset-auth", .help = "Clear the web UI admin credential and drop sessions immediately (no reboot)", .hint = NULL, .func = &cmd_gwcfg_reset_auth },
         { .command = "gwcfg-status", .help = "Show live uplink/relay state, RSSI and IPs", .hint = NULL, .func = &cmd_gwcfg_status },
         { .command = "gwcfg-scan", .help = "Scan for HaLow APs on this build's channel list", .hint = NULL, .func = &cmd_gwcfg_scan },
         { .command = "gwcfg-list-halow-channels", .help = "List legal (op_class, s1g_chan_num) pairs for gwcfg-set-halow-ap", .hint = NULL, .func = &cmd_gwcfg_list_halow_channels },

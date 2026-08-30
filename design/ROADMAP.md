@@ -6,7 +6,7 @@ you're picking the project back up.**
 - Companion docs: [`HARDWARE.md`](HARDWARE.md) (what to buy, how to build one, how to bring it up),
   [`PI_SIDE.md`](PI_SIDE.md) (the other end of the link)
 - Architecture diagram and repo layout: [`../README.md`](../README.md)
-- **Last updated:** 2026-08-30
+- **Last updated:** 2026-08-30 (web UI authentication implemented - item 1)
 
 Keep this file current: tick the checklist when a step passes, move an item out of "not built yet"
 when it lands, and add to "settled decisions" rather than re-arguing one. Historical detail
@@ -19,7 +19,7 @@ FGH100M-H — 902–928 MHz, US only.** One build, `CONFIG_HALOW_COUNTRY_CODE="U
 decisions" and [`HARDWARE.md`](HARDWARE.md) "Regulatory domain".
 
 `idf.py build` **passes end-to-end** against ESP-IDF v5.5.1 with the real `morsemicro/halow`
-component: **zero errors, zero warnings**, binary **~1.74 MB (`0x1be2f0`)**, **42% free** in the
+component: **zero errors, zero warnings**, binary **~1.75 MB (`0x1c02e0`)**, **42% free** in the
 3 MB app slot on confirmed 8 MB flash. Verified by actually running the build, not by reading code.
 
 That is 182,464 bytes (178 KB, 9.1%) smaller than the ~1.92 MB / 36% this sat at through the
@@ -85,15 +85,19 @@ callback, check which task will run it and what stack that task has.
 | Local SoftAP + DHCP | `main/downlink_softap.c` | 2.4 GHz AP + DHCP server for phones/tablets/ATAK devices. GW_ROLE_CLIENT only. |
 | HaLow STA uplink | `main/uplink_halow.c` | STA association, reconnect/backoff, bounded DHCP wait with disconnect-and-retry. Exposes a four-state link state, RSSI, a blocking scan wrapper, and radio version readback. GW_ROLE_CLIENT only. |
 | Wi-Fi STA uplink | `main/uplink_wifi.c` | GW_ROLE_RELAY only - native `esp_wifi` STA joining the Pi's own local AP directly (item 8 below). Same link-state/RSSI/callback shape as `uplink_halow.c`, event-driven reconnect against standard ESP-IDF STA events rather than a blocking task. |
-| HaLow AP downlink | `main/downlink_halow_ap.c` | GW_ROLE_RELAY only - HaLow radio in AP mode (`CONFIG_HALOW_AP_MODE`) so other XIAOs can associate to this node instead of a Pi (item 8 below). Static IP, no DHCP server - see the file's own header comment for why. Also exposes the regulatory channel table so an operator can pick a legal (op_class, s1g_chan_num) pair. **Confirmed on real hardware as of 2026-08-30**: starts cleanly, a leaf XIAO associates over HaLow, the downlink netif reports up (fixed - see "What the Aug 30 datapath-race run proved" below), and NAT + the CoT relay both come up behind it. `mmhalow_wifi_start()` itself still returns no code to confirm the AP came up (hence `gwcfg-status`'s "best-effort" wording for that one specific claim), but everything downstream of it now has independent confirmation. One known gap remains: `mmwlan_tx_pkt` intermittently logs "Unable to infer VIF ID" for some outbound multicast frames (~every 55s) - not yet confirmed whether this actually blocks CoT delivery to a HaLow leaf. Morse's own AP-mode API is still marked alpha. |
+| HaLow AP downlink | `main/downlink_halow_ap.c` | GW_ROLE_RELAY only - HaLow radio in AP mode (`CONFIG_HALOW_AP_MODE`) so other XIAOs can associate to this node instead of a Pi (item 8 below). Static IP, no DHCP server - see the file's own header comment for why. Also exposes the regulatory channel table so an operator can pick a legal (op_class, s1g_chan_num) pair. **Confirmed on real hardware as of 2026-08-30**: starts cleanly, a leaf XIAO associates over HaLow, the downlink netif reports up (fixed - see "What the Aug 30 datapath-race run proved" below), and NAT + the CoT relay both come up behind it. `mmhalow_wifi_start()` itself still returns no code to confirm the AP came up (hence `gwcfg-status`'s "best-effort" wording for that one specific claim), but everything downstream of it now has independent confirmation. `mmwlan_tx_pkt` used to intermittently log "Unable to infer VIF ID" for outbound frames toward a leaf, confirmed 2026-08-30 to actually block real CoT delivery *and* all NAT'd internet reply traffic through the mesh, not just IGMP housekeeping - see "Third" and "Fourth Aug 30 finding" below. **Worked around locally as of 2026-08-30** (`patch_vendored_halow.py`, applied automatically at CMake configure time) - verified 0/6 -> 6/6 packets forwarded across the fix. Morse's own AP-mode API is still marked alpha, and this remains a bug filed with them, not a real upstream fix. |
 | NAT / IP forwarding | `main/ip_forward_nat.c` | All three steps of ESP-IDF's NAT recipe: DNS propagation into the SoftAP's DHCP offers, uplink as default route, NAPT on the downlink. |
-| CoT multicast relay | `main/cot_relay.c` | One socket joined to 239.2.3.1:6969 on both netifs, `IP_PKTINFO`/`recvmsg()` for arrival interface, loop prevention via `IP_MULTICAST_LOOP` off + own-source drop. |
+| CoT multicast relay | `main/cot_relay.c` | One socket joined to 239.2.3.1:6969 on both netifs, `IP_PKTINFO`/`recvmsg()` for arrival interface, loop prevention via `IP_MULTICAST_LOOP` off + own-source drop. Tracks per-side rx/tx packet and byte counters (`cot_relay_get_counters()`), surfaced in `/api/status`'s `cot.uplink_side`/`cot.downlink_side` - groundwork for a real throughput number once traffic is flowing. Deliberately not a generic per-netif counter - see `cot_relay_counters_t`'s doc comment for why lwIP's MIB2 stats aren't reachable from application code here. |
+| Uplink RSSI history | `main/link_history.c` | Samples the active uplink's RSSI every 30s into a 240-sample (2h) ring, served at `/api/rssi-history` and drawn as a sparkline in the web UI's uplink card. Role-agnostic - tries both `uplink_halow_get_rssi()` and `uplink_wifi_get_rssi()` each tick and keeps whichever isn't reporting its idle sentinel. **Confirmed on real hardware 2026-08-30, with a caveat**: on a GW_ROLE_CLIENT leaf associated to a relay's HaLow AP, `uplink_halow_get_rssi()` reads a flat 0 dBm rather than a real value - see "Second Aug 30 finding" below the datapath-race section. The relay's own Wi-Fi-uplink RSSI (`uplink_wifi_get_rssi()`) reads correctly. |
+| Web UI authentication | `main/auth.c` / `.h` | Challenge-response login, RAM-only sessions, lockout/backoff, and the first-use/change password flow behind six new endpoints in `main/web_ui.c` - see item 1 under "Not built yet" for the full design and what's still pending hardware verification. |
+| DNS forwarding for HaLow leaves | `main/dns_forward.c` | GW_ROLE_RELAY only - a leaf's statically-addressed uplink has no DHCP lease to learn a DNS server from at all (`gw_uplink_config_t.static_dns`'s own comment), so this listens on the relay's own downlink (HaLow AP) address, port 53, and forwards queries out through the relay's own uplink using whatever real DNS server *that* hop actually has (read fresh via `esp_netif_get_dns_info()` per query, not cached - tracks a lease renewal automatically). Single task, `select()` over a listen socket and an upstream socket, an 8-slot pending-query table keyed by DNS transaction ID. A leaf points at it via `gwcfg-set-uplink-static-ip <ip> <gateway> <netmask> <relay's-own-downlink-ip>`. **Confirmed on real hardware 2026-08-30**: forwarder starts and binds correctly (`DNS forwarder listening on 172.16.60.1:53`); the actual query/response round-trip needs a device on a leaf's own SoftAP to test, which this project's own dev machine has no network path to - see the Fifth Aug 30 finding below for why this exists at all. |
 | Provisioning | `main/provisioning.c` | NVS config blob (magic + version stamped, validated on load and save) plus `gwcfg-*` console commands over USB Serial/JTAG. `gwcfg-set-role` selects GW_ROLE_CLIENT/GW_ROLE_RELAY at runtime - one firmware image, no separate relay build. |
 | Web config UI | `main/web_ui.c` / `.html` | `esp_http_server` + embedded HTML. `GET /api/status`, `GET`/`POST /api/config`, `GET /api/log`, `GET /api/tasks`, `POST /api/scan`, `POST /api/reboot`. Same NVS config as the console. Downlink clients only by default (SoftAP for GW_ROLE_CLIENT, HaLow AP for GW_ROLE_RELAY); **no authentication yet**. `allow_uplink_management` (off by default, `gwcfg-set-uplink-mgmt on\|off` or the web UI) opts a node into also accepting requests addressed to its own uplink IP - confirmed on real hardware 2026-08-30 (a relay reachable from its Wi-Fi uplink's subnet once enabled; a client on an unrelated third network that only routes there was correctly still refused - that's peer-subnet matching working as scoped, not a bug). |
 | Status LED | `main/status_led.c` | On-board GPIO21 LED blinks the uplink link state. The only instrument needing neither cable nor phone. |
 | Factory reset | `main/factory_reset.c` | 5 s BOOT-button hold restores defaults and reboots; LED acknowledges at 1.5 s. |
 | Stack headroom | `main/task_stats.c` | Worst-case free stack per task via `uxTaskGetStackHighWaterMark()`, surfaced as `gwcfg-tasks` and `GET /api/tasks`. Turns "is this close to overflowing?" into a number - see "Stack budgets" below. |
 | Log ring buffer | `main/log_buffer.c` | `esp_log_set_vprintf` tee into a 6 KB RAM ring, served at `/api/log`. Chains to the previous handler, so serial output is unaffected. |
+| Chip temperature | `main/chip_temp.c` | ESP32-S3 internal die temp via `esp_driver_tsens`, installed once at boot (20-100°C range) and read on each `/api/status` request; surfaced in the web UI's Hardware & Diagnostics card, colored as a warning at ≥80°C. **The HaLow module has no equivalent** — the vendored Morse Micro SDK (`mmwlan.h`/`mmhal_wlan.h`/`mmhal_app.h`/`mmosal.h`) exposes no thermal API for the MM6108/FGH100M-H at all, so its temperature isn't software-readable without external sensor hardware. **`temperature_sensor_install()` confirmed on real hardware 2026-08-30** (`Range [20C ~ 100C], error < 2` logged on boot) on both the relay and the leaf; `/api/status`'s `chip_temp_c` itself not yet checked over the network. |
 | App wiring | `main/app_main.c` | Brings up log buffer, LED, factory-reset watcher, console and web UI immediately; then one of two role-specific bring-up paths (`bring_up_client_role()` / `bring_up_relay_role()`). NAT + CoT relay come up via a shared helper once whichever uplink holds a usable IP, retrying on the next reconnect if that fails. |
 | Web flasher + CI | `docs/`, `.github/workflows/` | ESP Web Tools page, single US build. GitHub Actions builds `sdkconfig.defaults` unmodified and deploys to Pages; PRs build but don't deploy. |
 
@@ -151,28 +155,78 @@ before any firmware-upload path.** Everything else can be done in any order — 
 decide. Nothing here should start before the checklist above passes; features built against an
 unproven link get debugged twice.
 
-### 1. Web UI authentication — *blocks shipping and OTA*
+### 1. Web UI authentication — **implemented and confirmed on real hardware 2026-08-30**
 
-Association with the SoftAP is currently the only credential. The handlers do refuse requests from
-outside the SoftAP subnet, which restores the intended boundary, but that is subnet-based
-*authorization*, not authentication — it doesn't defend against a device already on the SoftAP.
-Acceptable for bench testing, not for shipping.
+Association with the SoftAP used to be the only credential — subnet-based *authorization*, not
+authentication, so a device already on the SoftAP could do everything the UI could. Landed as a
+challenge-response scheme per the settled decisions below:
 
-Design decisions are settled — see "Settled decisions" below. Implementation notes:
+- **`gw_config_t` gained `gw_auth_config_t auth`** (`password_set`, `salt[16]`, `iterations`,
+  `stored_key[32]`) — `GW_CONFIG_VERSION` bumped `5u -> 6u`.
+- **PBKDF2-HMAC-SHA256 runs client-side only**, in a ~2KB bundled JS crypto block in
+  `web_ui.html` (SHA-256 core adapted from Chris Veness's public-domain reference
+  implementation, verified against NIST/RFC 4231 test vectors and cross-checked against Python's
+  `hashlib.pbkdf2_hmac` before use) — the device only ever verifies one `mbedtls_md_hmac()` call
+  against a stored key, never derives one, keeping the 100,000-round KDF off the ESP32 entirely.
+- **Six new endpoints** (`main/web_ui.c`): `GET /api/auth/status`, `GET /api/auth/challenge`,
+  `POST /api/auth/login`, `POST /api/auth/logout`, `GET /api/auth/new-salt`,
+  `POST /api/auth/password` (the last two double as the first-use password-set flow and, once a
+  password exists, the change-password flow). All nine existing functional handlers gained a
+  third guard, `auth_require_session()`, alongside the unchanged `reject_if_remote()` and
+  `reject_if_not_json()` — auth is additive, not a replacement, exactly as planned.
+- **Sessions**: RAM-only, 4-slot table, `HttpOnly`/`SameSite=Strict` cookie, 30-minute sliding
+  idle timeout, in a new `main/auth.c`/`auth.h` with zero dependency on `esp_http_server.h` (same
+  split as `chip_temp.c`/`link_history.c`) — `web_ui.c` does all cookie/HTTP glue.
+- **Lockout**: 5 failures locks for 30s, doubling per subsequent failed window, capped at 5
+  minutes.
+- **Recovery**: `gwcfg-reset-auth` console command, saves and drops all sessions immediately (no
+  reboot needed) — deliberately diverges from `gwcfg-reset`'s edit-then-`gwcfg-save` convention
+  since this is a locked-out operator's recovery path, not a routine edit. BOOT-button factory
+  reset clears the credential for free (already zeroes the whole config).
+- **`main/CMakeLists.txt`** gained `mbedtls` in `PRIV_REQUIRES` — it was *not* previously a
+  dependency of `main` (confirmed by reading the file directly), correcting this doc's own earlier
+  "mbedtls is already linked" framing, which was only ever true of the ESP-IDF build as a whole.
+- **`GW_STACK_WEB_UI`** raised `6144 -> 7168` proactively (`main/task_stats.h`) — the existing
+  stack-budget measurement below already showed this task at ~74% used before any auth code
+  existed.
+- Two corrections against actual ESP-IDF v5.5.1 source, caught before they became compile errors
+  or shipped a body-less error response: `httpd_err_code_t` has no 429 or 409 member (the same
+  gap this project already documented for `HTTPD_503`/`HTTPD_409`), and `httpd_resp_send_err()`
+  always sends an HTML-wrapped body, never raw JSON — both auth error paths that need a structured
+  JSON body use `httpd_resp_set_status()` + a real cJSON tree instead.
 
-- The existing `reject_if_remote()` gate **stays**. Auth is added to it, not a replacement — the
-  two defend against different attackers.
-- Interim CSRF guards already exist in `web_ui.c` and also stay: the Host header must name the
-  SoftAP's own address (defeats DNS rebinding), and state-changing POSTs must declare
-  `Content-Type: application/json` (forces a CORS preflight on cross-origin requests, which the
-  server never approves). They close the drive-by-browser attack from a phone on the SoftAP, but
-  they are *not* authentication — a hostile client on the SoftAP can still do everything the UI
-  can until this item lands. If mDNS/captive portal (item 4) arrives first, the Host check must
-  learn those names or the UI becomes unreachable through them.
-- `gw_config_t` gains a salt, a hash, and a "password has been set" flag. That's a layout change:
-  bump `GW_CONFIG_VERSION`.
-- `factory_reset.c` must clear the stored credential too, or a forgotten password survives the one
-  recovery path a field-deployed node has.
+**Confirmed on real hardware 2026-08-30** (GW_ROLE_RELAY unit, driven directly over HTTP with the
+same PBKDF2/HMAC-SHA256 crypto the browser bundle uses, independently re-verified in Node against
+NIST/RFC 4231 vectors before being trusted to drive a real login):
+
+- First-use forced password-set: `password_set:false` on a freshly reset config, `GET
+  /api/status` (and every other functional endpoint) 401s with no session; `GET
+  /api/auth/new-salt` -> client-side PBKDF2 -> `POST /api/auth/password` lands directly in an
+  authenticated session, no second login needed.
+- Login + session gating: a valid session cookie makes every endpoint work; the identical request
+  with no cookie gets a clean 401.
+- **Stack headroom under real exercised load, not idle**: after a login, a password-set/change,
+  and a full-field `POST /api/config` in the same run, `GET /api/tasks` showed the `httpd` task at
+  **2524/7168 bytes free (35.2%)** — *better* headroom than the pre-auth baseline (26% free at
+  6144 bytes), confirming the proactive `GW_STACK_WEB_UI` raise was the right amount, not just an
+  untested guess.
+- Heap stable across the whole exercise: ~144-147KB free before and after, no drop suggesting a
+  leak from session/auth-state allocation.
+- Lockout: 5 wrong login attempts, the 6th returns `{"error":"locked_out","retry_after_s":30}`
+  from *both* `/api/auth/challenge` and `/api/auth/login` without even checking the submitted
+  response, exactly as designed. An existing session's own requests are unaffected by an active
+  lockout (confirmed by hitting `/api/status` with a valid cookie while locked out).
+- `gwcfg-reset-auth`: dropped the live session immediately (next request with the old cookie
+  401s) with no reboot, and confirmed it clears *only* `auth` — role, Wi-Fi uplink, HaLow AP
+  config and the running CoT relay were all still up and untouched afterward.
+
+**Still open, needs a phone in hand rather than a script**: PBKDF2 timing on a **real low/mid-end
+mobile browser** (100,000 iterations measured at ~600ms in Node's JIT on the dev machine used to
+build this - a real mobile browser, especially an older one, will be slower, and this is the one
+number in the whole design that's a judgment call rather than a verified fact); the 30-minute
+session idle timeout (not practical to wait out during this test); and the lockout's doubling
+schedule beyond the first 30s window (60/120/240/300s across repeated windows - only the initial
+trigger was exercised here).
 
 ### 2. OTA update delivery — *blocked on 1*
 
@@ -535,9 +589,201 @@ CoT relay's own join log, so likely lwIP's periodic IGMP membership-report refre
 traffic itself) - a gap in how the vendored AP-mode driver resolves which station a multicast frame
 should go to when the destination doesn't uniquely resolve to one. Not yet investigated further;
 CoT relay itself starts and stays up regardless, so this doesn't block the fix above, but it may
-mean some outbound multicast frames toward HaLow leaves are silently dropped periodically. Next
-relay session should check whether this actually blocks real CoT delivery to a HaLow-side leaf, or
-is cosmetic.
+mean some outbound multicast frames toward HaLow leaves are silently dropped periodically.
+
+#### Third Aug 30 finding: confirmed - the VIF ID bug does drop real CoT traffic, not just IGMP
+
+Tested directly using the new per-side counters (`cot_relay_get_counters()`, see "What's
+implemented"): with no Pi available, a laptop on the same network as the relay's native Wi-Fi
+uplink (home Wi-Fi, standing in for "the Pi's local AP" - functionally identical to that hop, since
+`uplink_wifi.c` just joins whatever AP it's configured for) sent one 81-byte UDP multicast packet
+directly to `239.2.3.1:6969`. `/api/status` before and after:
+
+```
+"uplink_side":   { "rx_packets": 1, "rx_bytes": 81, "tx_packets": 0, "tx_bytes": 0 }
+"downlink_side": { "rx_packets": 0, "rx_bytes": 0,   "tx_packets": 0, "tx_bytes": 0 }
+```
+
+Received on the uplink side, **never forwarded** to the downlink (HaLow AP) side toward the leaf.
+`/api/log` at the same moment shows exactly the expected failure chain, at the same timestamp as the
+test:
+
+```
+E (220870) Morse Micro HaLow NetIF: Packet failed to send - 12
+W (220870) cot_relay: sendto failed: errno -1
+```
+
+This settles the open question from the second finding above: it is **not** cosmetic and **not**
+limited to IGMP's own housekeeping - a real CoT event arriving on the uplink side while the VIF
+ambiguity is live is silently dropped before it ever reaches a HaLow-associated leaf. Filed as
+"Issue 1" in the Morse Micro bug report (`~/morse-micro-bug-reports.md`, submitted 2026-08-30) -
+worth adding this exact reproduction (one UDP packet, `rx_packets`/`tx_packets` before-and-after, the
+matching log line) as a follow-up comment on that issue, since "not yet confirmed" was the report's
+own caveat and this closes it.
+
+#### Fourth Aug 30 finding: the VIF ID bug also blocks NAT'd internet access through the mesh, and a workaround is now landed
+
+Surfaced by an actual end-to-end test: a phone joined a leaf's SoftAP, set its admin password
+through the new auth UI (confirming that flow works from a real device, not just this session's
+scripted checks), then tried to reach the internet through the mesh - and couldn't. Traced it to
+the exact same VIF ambiguity as the finding above, just on a different traffic shape: outbound
+(phone → internet) never touches the buggy path at all, but every **reply** has to transit the
+relay's HaLow AP downlink on its way back down to the leaf, which is exactly the code path that
+drops packets. One-directional failure, which is why outbound-only symptoms (DNS/HTTP requests
+leaving fine, nothing ever coming back) looked at first like a NAT misconfiguration rather than
+this already-known bug.
+
+**Root cause, traced one level deeper than the finding above**: `mmhalow.c` has exactly one
+`mmhalow_netif_driver_t`/netif, shared by both STA and AP modes (`mmhalow_init()` always creates
+one STA-shaped netif; `downlink_halow_ap.c` reconfigures the *same* netif into AP mode via
+`mmhalow_wifi_start()` -> `mmwlan_ap_enable()`, without ever creating a second one - the "sta_native
+ip: 172.16.60.1" wording already seen in this project's own boot logs for a relay's AP-mode netif
+is the tell). `halow_transmit()`, the one transmit callback this shared driver uses regardless of
+mode, always builds `metadata = { .tid = 0 }`, leaving `.vif` at `MMWLAN_VIF_UNSPECIFIED` - so once
+`mmwlan_ap_enable()` brings up a real AP VIF alongside the STA VIF that's always present as
+scaffolding, every future call is ambiguous, exactly per the finding above's root-cause chain.
+
+**Local workaround implemented and verified 2026-08-30** (`main/mmhalow.c`/`.h` are Apache-2.0
+licensed by Morse Micro - confirmed via their own SPDX headers - freely modifiable for this kind of
+local fix): a new `bool ap_mode_enabled` field on `mmhalow_netif_driver_t`, set `true` by
+`mmhalow_wifi_start()` right before `mmwlan_ap_enable()`, read by `halow_transmit()` to pass an
+explicit `MMWLAN_VIF_AP`/`MMWLAN_VIF_STA` instead of leaving the driver to guess. Verified with the
+same multicast-injection method as the finding above: **0/6 packets forwarded to the leaf before
+the patch, 6/6 after**, and zero "Unable to infer VIF ID"/"Packet failed to send" log lines across
+the whole post-patch run (previously one per packet). No behavior change for GW_ROLE_CLIENT
+(STA-only) nodes - `ap_mode_enabled` defaults false there, which resolves to the same
+`MMWLAN_VIF_STA` value inference already produced.
+
+**Made durable, since `managed_components/` is gitignored and re-fetched clean on every checkout or
+dependency bump**: `patch_vendored_halow.py` (repo root) reapplies this exact edit idempotently,
+invoked from the top-level `CMakeLists.txt` via `execute_process()` right after `project(...)`
+(which is what triggers the component-manager fetch - the patch step has to run after that, not
+before). Fails loudly rather than silently skipping the fix if the vendored file's shape has
+changed underneath it (e.g. a `morsemicro/halow` version bump) - matching this project's existing
+`minify_web_ui.py` philosophy. **Remove this whole mechanism once Morse Micro ships a real fix** -
+added as "Further update" on Issue 1 in `~/morse-micro-bug-reports.md`, since we now have a
+concrete, verified proposed fix to hand them, not just a bug report.
+
+#### Fifth Aug 30 finding: DNS was the last thing standing between a phone and real internet access through the mesh
+
+Surfaced immediately after the fix above: a phone joined a leaf's SoftAP, signed in through the
+new auth UI (confirming that flow works from a real device - a second win alongside the VIF fix),
+but still couldn't reach any external site, run a speed test, or reach anything else by name -
+while the leaf's own web UI (a bare IP address, no DNS involved) worked fine. That split - local-IP
+traffic fine, anything needing a hostname lookup dead - pointed at DNS specifically rather than a
+regression in the fix above.
+
+**Root cause**: `uplink_halow.c`'s `apply_static_ip()` (used by every leaf on a HaLow AP, since
+that hop has no DHCP server to lease an address *or* a DNS server from) never gave the uplink a DNS
+server at all - `ip_forward_nat.c`'s `propagate_dns()` already logs exactly this
+(`uplink DHCP lease carried no DNS server`) and was already documented in this file, but as a
+*deliberate* trade ("correct... for a hop whose whole purpose is carrying CoT, which is addressed
+by IP") - which stopped being true the moment real cross-mesh internet access became a goal, not
+just CoT.
+
+**First design considered and rejected**: hardcode a public resolver (e.g. 8.8.8.8) on the leaf's
+static uplink. Works, but two problems: it doesn't adapt if the relay's own upstream network's DNS
+server changes, and it needed reprovisioning every leaf individually. **Redirected mid-implementation
+by the user** toward a better design: have the leaf point at the *relay*, and have the relay forward
+using its own real upstream DNS server (which it already has correctly, via ordinary DHCP on its
+own Wi-Fi uplink - confirmed by that hop never showing the missing-DNS warning in any log this
+session). Landed as `main/dns_forward.c` (see "What's implemented" above) plus
+`gw_uplink_config_t.static_dns` (`GW_CONFIG_VERSION` bumped `6u -> 7u`) so a leaf has somewhere to
+point.
+
+**Confirmed on real hardware 2026-08-30**: the forwarder starts and binds
+(`dns_forward: DNS forwarder listening on 172.16.60.1:53`), and a leaf reconfigured with
+`gwcfg-set-uplink-static-ip 172.16.60.2 172.16.60.1 255.255.255.0 172.16.60.1` reassociates and
+shows up on the relay's own `connected_clients` count as before. **Not yet confirmed**: an actual
+query/response round-trip - that needs a device on a leaf's own SoftAP, which this project's dev
+machine has no network path to (same limitation noted for the VIF fix above). Next session with a
+phone in hand should confirm real browsing/speed-test/hostname-based traffic now works end to end.
+
+#### Second Aug 30 finding: HaLow STA RSSI reads a flat 0 dBm against a leaf-facing HaLow AP
+
+Surfaced by testing the RSSI-history feature (item 9's neighbor - see "What's implemented") on the
+same two-node relay+leaf pair right after the datapath-race fix above. `gwcfg-status` on the
+**leaf** (GW_ROLE_CLIENT, associated to the relay's HaLow AP, not a Pi) reported `uplink RSSI: 0
+dBm` immediately on association and **still 0 dBm minutes later**, confirmed twice over the serial
+console with real traffic (CoT relay running) in between. The **relay's own** uplink RSSI, over
+native Wi-Fi to a real Pi, read normally (-65/-66 dBm, `wifi RSSI` in its own `gwcfg-status`) in the
+same run - so this is specific to `mmwlan_get_rssi()` (`main/uplink_halow.c:569`, wraps `mmwlan.h`),
+not a general RSSI-plumbing bug in this project's own code.
+
+**Root-cause narrowed the same night, via source and a zero-rebuild diagnostic:**
+
+Read `managed_components/.../umac/datapath/umac_datapath.c` directly:
+`mmwlan_get_rssi()` -> `umac_stats_get_rssi()` (`umac_stats.c:329`) returns a field
+(`data->rssi`) whose *only* writer in the whole vendored tree is
+`umac_datapath_process_s1g_beacon()` (`umac_datapath.c:166-167`), gated on the received frame's
+subtype being `DOT11_FC_SUBTYPE_S1G_BEACON` *and* its source address matching the associated BSSID
+- and it sets the value straight from `rx_metadata->rssi`. First hypothesis was that this specific
+callback never fires against the alpha AP-mode driver's beacons.
+
+That hypothesis doesn't survive a second, independent reading, though: `gwcfg-scan` on the same
+leaf, against the same AP, **also** reported `RSSI 0 dBm` for both entries it found (904.5 MHz and
+905.0 MHz - two different frequencies, same exact `0`). Scan results come from **Probe Response**
+frames (`mmwlan_scan_result.rssi`'s own doc comment, `mmwlan.h` L704-707: "RSSI of the received
+frame... within the Probe Response frame") - a completely different code path from the S1G-beacon
+callback above, populated by `main/uplink_halow.c:609`'s `out.rssi = result->rssi`. Two unrelated
+consumers, both reading zero from the same underlying source, is what pointed the search at what
+they share: **both ultimately come from the driver's own per-frame RX metadata
+(`rx_metadata->rssi`)**, not from either call site's own logic. That relocates the likely fault from
+"a callback that never runs" to "the RX RSSI field the driver stamps on received frames isn't being
+populated with a real measurement" - specifically for frames arriving from this alpha AP-mode
+transmitter, since the relay's unrelated native-Wi-Fi RSSI (a completely different radio and driver)
+reads correctly in the same run.
+
+A live MMLOG-level diagnostic (bumping morselib's own log verbosity to VRB to watch frame RX
+directly) was attempted and abandoned: raising `MMLOG_LEVEL_OVRD` project-wide changes codegen
+enough to turn a latent, otherwise-silent `-Werror=maybe-uninitialized` in an unrelated vendored file
+(`morse_driver/mm6108/pageset.c:753`) into a hard build failure. Reverted cleanly (`CMakeLists.txt`
+has no diagnostic left in it) rather than fighting the warning or weakening `-Werror` project-wide
+for a one-off test - not worth the risk to the zero-warnings baseline for this.
+
+**Consequence for the RSSI-history/sparkline feature (`main/link_history.c`)**: on a leaf associated
+to a relay's HaLow AP, the sparkline renders a flat, plausible-looking `0 dBm` line instead of a gap
+or an error - misleading, not a crash. Deliberately **not** patched by treating `0` as a sentinel:
+the scan/association evidence narrows *where* the zero comes from, but not yet *why* the driver
+isn't measuring it, and one node/one short run isn't enough to know whether `0` is ever legitimate
+in some other topology.
+
+**Next diagnostic, and it needs no rebuild**: run `gwcfg-scan` against a **real Pi's** HaLow AP once
+one is confirmed to exist (`PI_SIDE.md` item 0) and compare. A real RSSI there would confirm this is
+specific to two Morse radios talking to each other with one side in the (alpha) software AP-mode
+role; a flat `0` there too would mean the gap is broader - in the STA-side RX RSSI capture itself,
+regardless of what's on the other end.
+
+### 9. Persistent log storage and expanded config — scoping notes (2026-08-30)
+
+Raised as "more log storage than anything" during the RSSI-history/CoT-counters work: the log ring
+(`main/log_buffer.c`) is 6KB of RAM and gone on every reboot, which is fine for "why did the last
+boot fail" but not for anything spanning a multi-hour field test or a power cycle.
+
+**Where it would live:** the ~1.81MB unallocated past the dual-OTA partitions (two 3MB slots +
+`otadata` on 8MB flash - see item 2) is enough for a small SPIFFS or FAT partition, no new hardware
+and no GPIO cost - see `HARDWARE.md`'s "Other candidates weighed against the same 3 pads" for why
+this beats an SD card for this specific need.
+
+**The factory-reset trap to design around from the start, not retrofit:** `factory_reset.c`'s
+`do_factory_reset()` clears state by overwriting the *one* `gw_config_t` NVS blob
+(`GWCFG_NVS_NAMESPACE`/`GWCFG_NVS_KEY` in `provisioning.c`) with defaults - that's the only
+persistent state that exists today, so today's factory reset is already complete. A flash-backed
+log or a config namespace added alongside it would **not** be touched by that same call; either
+needs its own explicit erase wired into `do_factory_reset()`, symmetric with the existing note on
+item 1 ("`factory_reset.c` must clear the stored credential too, or a forgotten password survives
+the one recovery path a field-deployed node has"). Same trap, same fix pattern, worth doing for
+both credential and log storage in the same pass rather than two.
+
+**Wear**: SPIFFS/FAT on raw flash has no wear leveling of its own guarantee beyond what ESP-IDF's
+`wear_levelling` component provides for FAT - worth confirming which is actually in use before
+writing at any real frequency (RSSI-history-style periodic samples are fine; per-packet CoT logging
+to flash would not be).
+
+**Persistent config "for somethings"**: no concrete second config namespace has been scoped yet -
+revisit once there's an actual field that doesn't belong in `gw_config_t` (a single versioned NVS
+blob already covers node identity, role, radio credentials, and CoT settings) rather than adding a
+second store speculatively.
 
 ## Settled decisions
 
@@ -551,7 +797,7 @@ Recorded so they aren't relitigated, and so they aren't accidentally undone.
 | TLS | **No** | No CA issues certificates for a private IP, and a self-signed cert trains users to click through browser warnings — worse than no TLS, because it erodes the one signal that matters elsewhere. TLS also costs RAM on a device already running NAT and the relay. WPA2 on the SoftAP is the transport protection. |
 | Password on the wire | **Challenge-response** — server issues a nonce, client returns `HMAC(stored_key, nonce)` | With WPA2-PSK, anyone who knows the AP passphrase can decrypt other clients' traffic. A team may share the Wi-Fi passphrase without every member being an administrator. |
 | Browser crypto | **A bundled ~2 KB SHA-256/HMAC** | ⚠️ `crypto.subtle` is only exposed in *secure contexts*, and `http://172.16.50.1` is not one (only `localhost` is trusted over plain HTTP). **Do not "simplify" this back to WebCrypto later — it will silently be `undefined` on the device.** |
-| Storage | PBKDF2-HMAC-SHA256, per-device random salt in NVS | mbedtls is already linked. Never store the password itself. Logins are rare, so err high on iterations. |
+| Storage | PBKDF2-HMAC-SHA256, per-device random salt in NVS | Implemented 2026-08-30 - see item 1. The KDF itself runs client-side (mbedtls is only used on-device for the one HMAC-SHA256 verification at login, added to `main/CMakeLists.txt`'s `PRIV_REQUIRES` - it was not previously a `main` dependency, correcting this row's earlier claim). Never store the password itself. Logins are rare, so err high on iterations. |
 | Sessions | `esp_random()` tokens, RAM only, small fixed table, idle timeout, `HttpOnly` + `SameSite=Strict` | Tokens should not survive a reboot. |
 | Brute force | Lockout or backoff | The attacker here is already on the LAN. |
 | Recovery | `gwcfg-reset-auth` on the serial console, plus the BOOT-button reset | Physically-present-only is the right trust model. **An undocumented recovery path is the same as none** — document it prominently. |

@@ -32,8 +32,15 @@ static struct sockaddr_in s_group_dest;
 /* send_via() does setsockopt(IP_MULTICAST_IF) + sendto() as a pair on one
  * shared socket; without this lock a concurrent caller (relay_task vs. a
  * future cot_relay_inject() self-beacon) could retarget the egress
- * interface between another sender's two calls. */
+ * interface between another sender's two calls. Also serializes the tx
+ * counters below (incremented inside send_via() itself) against
+ * cot_relay_get_counters()'s reads (httpd task). The rx counters are
+ * deliberately *not* under this lock - see relay_task()'s own comment on
+ * why an occasional torn read there is an acceptable tradeoff. */
 static SemaphoreHandle_t s_send_lock = NULL;
+
+static cot_relay_counters_t s_counters_a; /* rx = arrived on a, tx = forwarded onto a */
+static cot_relay_counters_t s_counters_b;
 
 static esp_err_t get_netif_addr(esp_netif_t *netif, struct in_addr *out)
 {
@@ -58,7 +65,7 @@ static esp_err_t join_group(int sock, const struct in_addr *iface_addr, const st
     return ESP_OK;
 }
 
-static void send_via(esp_netif_t *netif, const void *data, size_t len)
+static void send_via(esp_netif_t *netif, cot_relay_counters_t *counters, const void *data, size_t len)
 {
     struct in_addr iface_addr;
     if (get_netif_addr(netif, &iface_addr) != ESP_OK || iface_addr.s_addr == 0) {
@@ -70,6 +77,9 @@ static void send_via(esp_netif_t *netif, const void *data, size_t len)
         ESP_LOGW(TAG, "IP_MULTICAST_IF failed: errno %d", errno);
     } else if (sendto(s_sock, data, len, 0, (struct sockaddr *)&s_group_dest, sizeof(s_group_dest)) < 0) {
         ESP_LOGW(TAG, "sendto failed: errno %d", errno);
+    } else if (counters != NULL) {
+        counters->tx_packets++;
+        counters->tx_bytes += len;
     }
     xSemaphoreGive(s_send_lock);
 }
@@ -183,17 +193,32 @@ static void relay_task(void *arg)
         }
 
         esp_netif_t *forward_to = NULL;
+        cot_relay_counters_t *rx_counters = NULL;
+        cot_relay_counters_t *tx_counters = NULL;
         if (arrival_ifindex == s_ifindex_a) {
             forward_to = s_netif_b;
+            rx_counters = &s_counters_a;
+            tx_counters = &s_counters_b;
         } else if (arrival_ifindex == s_ifindex_b) {
             forward_to = s_netif_a;
+            rx_counters = &s_counters_b;
+            tx_counters = &s_counters_a;
         }
 
         if (forward_to == NULL) {
             continue; /* arrived via neither known interface - drop rather than guess */
         }
 
-        send_via(forward_to, rx_buffer, len);
+        /* Unlocked: relay_task is the only writer of rx_packets/rx_bytes, and
+         * a torn read by cot_relay_get_counters() on a stats display is
+         * harmless (self-corrects next read) - not worth serializing the hot
+         * receive path over. tx counters below go through send_via(), which
+         * already holds s_send_lock for the socket call they have to be
+         * consistent with anyway. */
+        rx_counters->rx_packets++;
+        rx_counters->rx_bytes += (size_t)len;
+
+        send_via(forward_to, tx_counters, rx_buffer, len);
     }
 }
 
@@ -325,7 +350,19 @@ esp_err_t cot_relay_inject(const void *data, size_t len)
     if (s_sock < 0) {
         return ESP_ERR_INVALID_STATE;
     }
-    send_via(s_netif_a, data, len);
-    send_via(s_netif_b, data, len);
+    send_via(s_netif_a, &s_counters_a, data, len);
+    send_via(s_netif_b, &s_counters_b, data, len);
     return ESP_OK;
+}
+
+void cot_relay_get_counters(cot_relay_counters_t *out_uplink, cot_relay_counters_t *out_downlink)
+{
+    xSemaphoreTake(s_send_lock, portMAX_DELAY);
+    if (out_uplink != NULL) {
+        *out_uplink = s_counters_a;
+    }
+    if (out_downlink != NULL) {
+        *out_downlink = s_counters_b;
+    }
+    xSemaphoreGive(s_send_lock);
 }

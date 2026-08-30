@@ -276,6 +276,12 @@
   .dot.down { background: var(--color-warn); box-shadow: 0 0 6px var(--color-warn); }
 
   /* Signal Meter Bars */
+  .rssi-sparkline {
+    display: block;
+    width: 100%;
+    height: 40px;
+    margin-top: 0.25rem;
+  }
   .signal-meter {
     display: inline-flex;
     align-items: flex-end;
@@ -559,6 +565,43 @@
 </head>
 <body>
 
+<!-- Web UI authentication (design/ROADMAP.md item 1). Shown instead of
+     appShell until initAuth() confirms a session; renders either the login
+     or the forced first-use password-set form depending on password_set. -->
+<div id="authScreen" hidden>
+  <div class="hud-card" style="max-width: 26rem; margin: 4rem auto;">
+    <div class="card-header">
+      <span class="card-title" id="authScreenTitle">Sign In</span>
+    </div>
+
+    <div id="authLoginForm">
+      <div class="form-group">
+        <label for="authLoginPassword">Password</label>
+        <input type="password" id="authLoginPassword" autocomplete="current-password">
+      </div>
+      <p class="hint" id="authLoginHint"></p>
+      <button type="button" class="btn-primary" id="authLoginBtn" style="width:100%; margin-top:0.5rem;">Sign In</button>
+    </div>
+
+    <div id="authSetPasswordForm" hidden>
+      <p class="hint">This node has no admin password yet. Set one to continue - it will be
+        required for all further access, including the config UI you're looking at right now.</p>
+      <div class="form-group">
+        <label for="authNewPassword">New Password</label>
+        <input type="password" id="authNewPassword" autocomplete="new-password">
+      </div>
+      <div class="form-group">
+        <label for="authNewPasswordConfirm">Confirm Password</label>
+        <input type="password" id="authNewPasswordConfirm" autocomplete="new-password">
+      </div>
+      <p class="hint" id="authSetPasswordHint"></p>
+      <button type="button" class="btn-primary" id="authSetPasswordBtn" style="width:100%; margin-top:0.5rem;">Set Password</button>
+    </div>
+  </div>
+</div>
+
+<div id="appShell" hidden>
+
 <header>
   <div class="eyebrow">
     <div class="eyebrow-left">
@@ -620,6 +663,10 @@
             <span class="stat-label">Regulatory Domain</span>
             <span class="stat-value" id="stRegionDomain">US (902-928MHz)</span>
           </div>
+          <div class="metric-item" style="grid-column: 1 / -1;">
+            <span class="stat-label">RSSI History (last 2h)</span>
+            <canvas id="sparkRssiClient" class="rssi-sparkline"></canvas>
+          </div>
         </div>
       </div>
 
@@ -676,6 +723,10 @@
             <span class="stat-label">ATAK CoT Relay</span>
             <span class="stat-value"><span id="dotCotRelay" class="dot"></span><span id="stCotRelay">&mdash;</span></span>
           </div>
+          <div class="metric-item" style="grid-column: 1 / -1;">
+            <span class="stat-label">RSSI History (last 2h)</span>
+            <canvas id="sparkRssiRelay" class="rssi-sparkline"></canvas>
+          </div>
         </div>
       </div>
 
@@ -719,6 +770,10 @@
         <div class="metric-item">
           <span class="stat-label">Free Heap Memory</span>
           <span class="stat-value" id="stHeap">&mdash;</span>
+        </div>
+        <div class="metric-item">
+          <span class="stat-label">Chip Temp</span>
+          <span class="stat-value" id="stChipTemp">&mdash;</span>
         </div>
         <div class="metric-item">
           <span class="stat-label">Firmware Version</span>
@@ -823,6 +878,14 @@
           <div class="form-group">
             <label for="uplink_static_netmask">Subnet Mask</label>
             <input type="text" id="uplink_static_netmask" placeholder="255.255.255.0">
+          </div>
+          <div class="form-group">
+            <label for="uplink_static_dns">DNS Server (optional)</label>
+            <input type="text" id="uplink_static_dns" placeholder="172.16.60.1">
+            <p class="hint">A static uplink has no DHCP lease to learn a DNS server from. Point
+              this at the relay's own downlink address, not a public resolver - the relay
+              forwards queries from there using its own real upstream DNS server. Leave blank
+              for no name resolution on this hop.</p>
           </div>
         </div>
       </div>
@@ -1011,7 +1074,209 @@
   </div>
 </aside>
 
+</div>
+
 <div id="status" role="status" aria-live="polite"></div>
+
+<script>
+/* GW crypto: SHA-256, HMAC-SHA256, PBKDF2-HMAC-SHA256 - ES5, byte-array
+ * based, ~2KB (design/ROADMAP.md item 1's settled "bundled ~2KB SHA-256/HMAC"
+ * decision - crypto.subtle is unavailable in insecure contexts, and
+ * http://172.16.50.1 is not one).
+ *
+ * The SHA-256 core (GWSHA256_K, gwsha256Rotr, gwsha256Compress, gwSha256) is
+ * ported from Chris Veness's public-domain reference implementation
+ * (github.com/chrisveness/crypto, sha256.js, MIT licence) - same constants
+ * and compression logic verbatim, adapted from its ES6-class/char-code-string
+ * form to plain ES5 (var, function expressions, no class/arrow/let/const)
+ * operating on byte arrays directly, matching this file's own style and
+ * main/minify_web_ui.py's proven-safe assumptions. HMAC-SHA256 (RFC 2104)
+ * and PBKDF2-HMAC-SHA256 (PKCS#5/RFC 8018) on top are new, thin composition
+ * code - textbook algorithm, nothing novel. Verified against NIST's SHA-256
+ * test vectors, RFC 4231's HMAC-SHA256 test cases, and PBKDF2-HMAC-SHA256
+ * output cross-checked against Python's hashlib.pbkdf2_hmac before this ever
+ * touched a real password. */
+'use strict';
+
+var GWSHA256_K = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+];
+
+function gwsha256Rotr(n, x) {
+    return (x >>> n) | (x << (32 - n));
+}
+
+function gwsha256Compress(H, W) {
+    var a = H[0], b = H[1], c = H[2], d = H[3], e = H[4], f = H[5], g = H[6], h = H[7];
+    var t, T1, T2, S0, S1, ch, maj;
+    for (t = 0; t < 64; t++) {
+        S1 = gwsha256Rotr(6, e) ^ gwsha256Rotr(11, e) ^ gwsha256Rotr(25, e);
+        ch = (e & f) ^ (~e & g);
+        T1 = (h + S1 + ch + GWSHA256_K[t] + W[t]) >>> 0;
+        S0 = gwsha256Rotr(2, a) ^ gwsha256Rotr(13, a) ^ gwsha256Rotr(22, a);
+        maj = (a & b) ^ (a & c) ^ (b & c);
+        T2 = (S0 + maj) >>> 0;
+        h = g;
+        g = f;
+        f = e;
+        e = (d + T1) >>> 0;
+        d = c;
+        c = b;
+        b = a;
+        a = (T1 + T2) >>> 0;
+    }
+    H[0] = (H[0] + a) >>> 0;
+    H[1] = (H[1] + b) >>> 0;
+    H[2] = (H[2] + c) >>> 0;
+    H[3] = (H[3] + d) >>> 0;
+    H[4] = (H[4] + e) >>> 0;
+    H[5] = (H[5] + f) >>> 0;
+    H[6] = (H[6] + g) >>> 0;
+    H[7] = (H[7] + h) >>> 0;
+}
+
+function gwSha256(bytes) {
+    var H = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+
+    var bitLen = bytes.length * 8;
+    var bitLenHi = Math.floor(bitLen / 4294967296);
+    var bitLenLo = bitLen >>> 0;
+
+    var padded = bytes.slice();
+    padded.push(0x80);
+    while ((padded.length % 64) !== 56) {
+        padded.push(0x00);
+    }
+    padded.push((bitLenHi >>> 24) & 0xff, (bitLenHi >>> 16) & 0xff, (bitLenHi >>> 8) & 0xff, bitLenHi & 0xff);
+    padded.push((bitLenLo >>> 24) & 0xff, (bitLenLo >>> 16) & 0xff, (bitLenLo >>> 8) & 0xff, bitLenLo & 0xff);
+
+    var blockCount = padded.length / 64;
+    var blockIdx, t, W, i, s0, s1;
+    for (blockIdx = 0; blockIdx < blockCount; blockIdx++) {
+        W = new Array(64);
+        for (t = 0; t < 16; t++) {
+            i = blockIdx * 64 + t * 4;
+            W[t] = ((padded[i] << 24) | (padded[i + 1] << 16) | (padded[i + 2] << 8) | padded[i + 3]) >>> 0;
+        }
+        for (t = 16; t < 64; t++) {
+            s0 = gwsha256Rotr(7, W[t - 15]) ^ gwsha256Rotr(18, W[t - 15]) ^ (W[t - 15] >>> 3);
+            s1 = gwsha256Rotr(17, W[t - 2]) ^ gwsha256Rotr(19, W[t - 2]) ^ (W[t - 2] >>> 10);
+            W[t] = (W[t - 16] + s0 + W[t - 7] + s1) >>> 0;
+        }
+        gwsha256Compress(H, W);
+    }
+
+    var out = [];
+    for (i = 0; i < 8; i++) {
+        out.push((H[i] >>> 24) & 0xff, (H[i] >>> 16) & 0xff, (H[i] >>> 8) & 0xff, H[i] & 0xff);
+    }
+    return out;
+}
+
+function gwHmacSha256(keyBytes, messageBytes) {
+    var blockSize = 64;
+    var key = keyBytes.slice();
+    if (key.length > blockSize) {
+        key = gwSha256(key);
+    }
+    while (key.length < blockSize) {
+        key.push(0x00);
+    }
+    var ipad = new Array(blockSize);
+    var opad = new Array(blockSize);
+    var i;
+    for (i = 0; i < blockSize; i++) {
+        ipad[i] = key[i] ^ 0x36;
+        opad[i] = key[i] ^ 0x5c;
+    }
+    var inner = gwSha256(ipad.concat(messageBytes));
+    return gwSha256(opad.concat(inner));
+}
+
+function gwPbkdf2Sha256(passwordBytes, saltBytes, iterations, dkLenBytes) {
+    var hLen = 32;
+    var blockCount = Math.ceil(dkLenBytes / hLen);
+    var derived = [];
+    var blockIndex, i, j, u, t, intBlock;
+    for (blockIndex = 1; blockIndex <= blockCount; blockIndex++) {
+        intBlock = [
+            (blockIndex >>> 24) & 0xff,
+            (blockIndex >>> 16) & 0xff,
+            (blockIndex >>> 8) & 0xff,
+            blockIndex & 0xff
+        ];
+        u = gwHmacSha256(passwordBytes, saltBytes.concat(intBlock));
+        t = u.slice();
+        for (i = 1; i < iterations; i++) {
+            u = gwHmacSha256(passwordBytes, u);
+            for (j = 0; j < hLen; j++) {
+                t[j] ^= u[j];
+            }
+        }
+        derived = derived.concat(t);
+    }
+    return derived.slice(0, dkLenBytes);
+}
+
+function gwBytesToHex(bytes) {
+    var hex = '';
+    var digits = '0123456789abcdef';
+    var i, b;
+    for (i = 0; i < bytes.length; i++) {
+        b = bytes[i];
+        hex += digits.charAt((b >> 4) & 0xf) + digits.charAt(b & 0xf);
+    }
+    return hex;
+}
+
+function gwHexToBytes(hex) {
+    var bytes = [];
+    var i;
+    for (i = 0; i < hex.length; i += 2) {
+        bytes.push(parseInt(hex.substr(i, 2), 16));
+    }
+    return bytes;
+}
+
+function gwUtf8Bytes(str) {
+    var bytes = [];
+    var i, code, hi, lo, cp;
+    for (i = 0; i < str.length; i++) {
+        code = str.charCodeAt(i);
+        if (code < 0x80) {
+            bytes.push(code);
+        } else if (code < 0x800) {
+            bytes.push(0xc0 | (code >> 6), 0x80 | (code & 0x3f));
+        } else if (code >= 0xd800 && code <= 0xdbff && i + 1 < str.length) {
+            hi = code;
+            lo = str.charCodeAt(++i);
+            cp = 0x10000 + ((hi - 0xd800) << 10) + (lo - 0xdc00);
+            bytes.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3f), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+        } else {
+            bytes.push(0xe0 | (code >> 12), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
+        }
+    }
+    return bytes;
+}
+
+var gwCrypto = {
+    pbkdf2Sha256Hex: function (password, saltHex, iterations, dkLenBytes) {
+        var derived = gwPbkdf2Sha256(gwUtf8Bytes(password), gwHexToBytes(saltHex), iterations, dkLenBytes);
+        return gwBytesToHex(derived);
+    },
+    hmacSha256Hex: function (keyHex, messageHex) {
+        var mac = gwHmacSha256(gwHexToBytes(keyHex), gwHexToBytes(messageHex));
+        return gwBytesToHex(mac);
+    }
+};
+</script>
 
 <script>
 'use strict';
@@ -1030,6 +1295,43 @@ function showStatus(msg, ok) {
   if (bar) bar.textContent = msg;
   clearTimeout(showStatus._t);
   if (ok) showStatus._t = setTimeout(function () { s.className = ''; }, 4000);
+}
+
+/* Web UI authentication (design/ROADMAP.md item 1). authScreen and appShell
+ * are mutually exclusive - #status stays a sibling of both (not inside
+ * either) so showStatus() keeps working on the login screen too. */
+function showAuthScreen(mode, message) {
+  el('appShell').hidden = true;
+  el('authScreen').hidden = false;
+  var isSetPassword = mode === 'set-password';
+  el('authLoginForm').hidden = isSetPassword;
+  el('authSetPasswordForm').hidden = !isSetPassword;
+  el('authScreenTitle').textContent = isSetPassword ? 'Set Admin Password' : 'Sign In';
+  if (isSetPassword) {
+    el('authSetPasswordHint').textContent = '';
+  } else {
+    el('authLoginHint').textContent = message || '';
+  }
+}
+
+function showApp() {
+  el('authScreen').hidden = true;
+  el('appShell').hidden = false;
+  initChannelList();
+  loadConfig();
+  loadStatus();
+  statusTimer = setInterval(loadStatus, 5000);
+  loadRssiHistory();
+  setInterval(loadRssiHistory, 30000);
+}
+
+/* Called from every fetch() below on a 401 - an idle-timed-out or otherwise
+ * invalidated session (e.g. a concurrent gwcfg-reset-auth). Stops the
+ * pollers so they don't keep hammering a session that no longer exists. */
+function handleAuthExpiry() {
+  if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
+  if (logTimer) { clearInterval(logTimer); logTimer = null; }
+  showAuthScreen('login', 'Your session expired - please sign in again.');
 }
 
 function fmtUptime(sec) {
@@ -1056,6 +1358,70 @@ function updateRssiMeter(rssi, meterId) {
   else if (rssi >= -75) meter.classList.add('level-3');
   else if (rssi >= -85) meter.classList.add('level-2');
   else meter.classList.add('level-1');
+}
+
+/* Plain <canvas>, not a library - the whole point of the minify+gzip step
+ * (main/minify_web_ui.py) is keeping this embedded page small, and a
+ * dozen-line line-chart doesn't earn a dependency. `values` is oldest-first,
+ * matching /api/rssi-history's own order; null entries (link_history.c's
+ * "no reading yet" gaps) break the line rather than being interpolated
+ * through, so a gap in coverage reads as a gap, not a fabricated trend. */
+function drawSparkline(canvasId, values) {
+  var canvas = el(canvasId);
+  if (!canvas) return;
+
+  var cssWidth = canvas.clientWidth || 300;
+  var cssHeight = canvas.clientHeight || 40;
+  var dpr = window.devicePixelRatio || 1;
+  canvas.width = cssWidth * dpr;
+  canvas.height = cssHeight * dpr;
+
+  var ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssWidth, cssHeight);
+
+  var known = values.filter(function (v) { return typeof v === 'number'; });
+  if (known.length === 0) return;
+
+  var min = Math.min.apply(null, known);
+  var max = Math.max.apply(null, known);
+  /* Flat line still gets drawn mid-height rather than dividing by zero below. */
+  if (min === max) { min -= 1; max += 1; }
+
+  var pad = 2;
+  var xStep = values.length > 1 ? (cssWidth - pad * 2) / (values.length - 1) : 0;
+  var style = getComputedStyle(document.documentElement);
+  ctx.strokeStyle = style.getPropertyValue('--color-accent').trim() || '#c1662d';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+
+  var drawing = false;
+  for (var i = 0; i < values.length; i++) {
+    var v = values[i];
+    if (typeof v !== 'number') { drawing = false; continue; }
+    var x = pad + i * xStep;
+    var y = pad + (1 - (v - min) / (max - min)) * (cssHeight - pad * 2);
+    if (!drawing) { ctx.moveTo(x, y); drawing = true; }
+    else { ctx.lineTo(x, y); }
+  }
+  ctx.stroke();
+}
+
+async function loadRssiHistory() {
+  try {
+    var res = await fetch('/api/rssi-history', { cache: 'no-store' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    var data = await res.json();
+    var samples = data.rssi_dbm || [];
+    /* Both cards' canvases exist in the DOM regardless of role (only one is
+     * visible via the parent's [hidden]) - drawing into the hidden one too
+     * is cheap and means it's already current if the operator switches role. */
+    drawSparkline('sparkRssiClient', samples);
+    drawSparkline('sparkRssiRelay', samples);
+  } catch (e) {
+    /* Best-effort only - a missed history point isn't worth surfacing an
+     * error banner over, unlike loadStatus()'s failures. */
+  }
 }
 
 // Tab Switching
@@ -1114,6 +1480,7 @@ async function loadStatus() {
   if (scanning) return;
   try {
     var res = await fetch('/api/status', { cache: 'no-store' });
+    if (res.status === 401) { handleAuthExpiry(); return; }
     if (!res.ok) throw new Error('HTTP ' + res.status);
     var s = await res.json();
 
@@ -1167,6 +1534,17 @@ async function loadStatus() {
     if (s.system) {
       el('stUptime').textContent = fmtUptime(s.system.uptime_s);
       el('stHeap').textContent = Math.round(s.system.heap_free / 1024) + ' KB';
+      var chipTempEl = el('stChipTemp');
+      if (s.system.chip_temp_c === null || s.system.chip_temp_c === undefined) {
+        chipTempEl.textContent = 'n/a';
+        chipTempEl.style.color = '';
+      } else {
+        chipTempEl.textContent = Math.round(s.system.chip_temp_c) + '°C';
+        /* 80C is not a datasheet limit, just a "worth a look" line for an
+         * ESP32-S3 die reading in an enclosure - same inline-warn pattern as
+         * the stack-headroom table below (t.free < 256). */
+        chipTempEl.style.color = s.system.chip_temp_c >= 80 ? 'var(--color-warn)' : '';
+      }
       el('stVersion').textContent = s.system.version ? ('v' + s.system.version) : '—';
       el('hdrVerBadge').textContent = s.system.version ? ('v' + s.system.version.substring(0, 7)) : 'v—';
       el('stPartition').textContent = s.system.partition || 'ota_0';
@@ -1311,6 +1689,7 @@ async function initChannelList() {
 async function loadConfig() {
   try {
     var res = await fetch('/api/config', { cache: 'no-store' });
+    if (res.status === 401) { handleAuthExpiry(); return; }
     if (!res.ok) throw new Error('HTTP ' + res.status);
     var cfg = await res.json();
     el('node_id').value = cfg.node_id || '';
@@ -1325,6 +1704,7 @@ async function loadConfig() {
     el('uplink_static_ip').value = (cfg.uplink && cfg.uplink.static_ip) || '';
     el('uplink_static_gateway').value = (cfg.uplink && cfg.uplink.static_gateway) || '';
     el('uplink_static_netmask').value = (cfg.uplink && cfg.uplink.static_netmask) || '';
+    el('uplink_static_dns').value = (cfg.uplink && cfg.uplink.static_dns) || '';
 
     el('softap_ssid').value = (cfg.softap && cfg.softap.ssid) || '';
     el('softap_channel').value = (cfg.softap && cfg.softap.channel) || 6;
@@ -1364,7 +1744,8 @@ async function saveConfig() {
       use_static_ip: el('uplink_use_static_ip').checked,
       static_ip: el('uplink_static_ip').value,
       static_gateway: el('uplink_static_gateway').value,
-      static_netmask: el('uplink_static_netmask').value
+      static_netmask: el('uplink_static_netmask').value,
+      static_dns: el('uplink_static_dns').value
     },
     softap: {
       ssid: el('softap_ssid').value,
@@ -1396,7 +1777,9 @@ async function saveConfig() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
     });
-    if (res.ok) {
+    if (res.status === 401) {
+      handleAuthExpiry();
+    } else if (res.ok) {
       showStatus('Configuration saved. Reboot node to apply.', true);
       el('uplink_psk').value = '';
       el('softap_psk').value = '';
@@ -1422,7 +1805,8 @@ el('rebootBtn').addEventListener('click', async function () {
   showStatus('Rebooting node…', true);
   clearInterval(statusTimer);
   try {
-    await fetch('/api/reboot', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
+    var res = await fetch('/api/reboot', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
+    if (res.status === 401) { handleAuthExpiry(); return; }
   } catch (e) {
     /* expected disconnect */
   }
@@ -1441,6 +1825,7 @@ el('scanBtn').addEventListener('click', async function () {
   scanning = true;
   try {
     var res = await fetch('/api/scan', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
+    if (res.status === 401) { handleAuthExpiry(); return; }
     if (!res.ok) {
       var text = await res.text().catch(function () { return ''; });
       throw new Error(text ? text.replace(/<[^>]*>/g, '').trim() : 'HTTP ' + res.status);
@@ -1505,6 +1890,7 @@ el('scanBtn').addEventListener('click', async function () {
 async function loadLog() {
   try {
     var res = await fetch('/api/log', { cache: 'no-store' });
+    if (res.status === 401) { handleAuthExpiry(); return; }
     if (!res.ok) throw new Error('HTTP ' + res.status);
     var view = el('logView');
     var atBottom = view.scrollHeight - view.scrollTop - view.clientHeight < 40;
@@ -1527,6 +1913,7 @@ el('tasksBtn').addEventListener('click', async function () {
   out.textContent = 'Reading task stacks...';
   try {
     var res = await fetch('/api/tasks', { cache: 'no-store' });
+    if (res.status === 401) { handleAuthExpiry(); return; }
     if (!res.ok) throw new Error('HTTP ' + res.status);
     var tasks = (await res.json()).tasks || [];
     out.textContent = '';
@@ -1616,10 +2003,122 @@ el('copyLogBtn').addEventListener('click', function() {
   }
 });
 
-initChannelList();
-loadConfig();
-loadStatus();
-statusTimer = setInterval(loadStatus, 5000);
+/* showApp() (called from initAuth() below once a session is confirmed)
+ * itself does what used to run unconditionally here: initChannelList(),
+ * loadConfig(), loadStatus() plus its 5s poll, loadRssiHistory() plus its
+ * 30s poll (matches LINK_HISTORY_INTERVAL_S, main/link_history.h - polling
+ * faster than new samples arrive would just redraw the identical chart).
+ * Nothing in appShell should run before a session exists. */
+
+el('authLoginBtn').addEventListener('click', async function () {
+  var btn = this;
+  var password = el('authLoginPassword').value;
+  if (!password) {
+    el('authLoginHint').textContent = 'Enter your password.';
+    return;
+  }
+  btn.disabled = true;
+  el('authLoginHint').textContent = 'Signing in…';
+  try {
+    var chRes = await fetch('/api/auth/challenge', { cache: 'no-store' });
+    var ch = await chRes.json();
+    if (!chRes.ok) {
+      el('authLoginHint').textContent = ch.error === 'locked_out'
+        ? ('Too many attempts - try again in ' + ch.retry_after_s + 's.')
+        : 'Could not start login - reload and try again.';
+      return;
+    }
+    /* PBKDF2 runs here, client-side, at the salt/iterations the server just
+     * issued - see design/ROADMAP.md item 1 for why the device never derives
+     * this itself. */
+    var storedKey = gwCrypto.pbkdf2Sha256Hex(password, ch.salt, ch.iterations, 32);
+    var response = gwCrypto.hmacSha256Hex(storedKey, ch.nonce);
+    var loginRes = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ nonce: ch.nonce, response: response })
+    });
+    var loginBody = await loginRes.json().catch(function () { return {}; });
+    if (loginRes.ok) {
+      el('authLoginPassword').value = '';
+      showApp();
+    } else if (loginBody.error === 'locked_out') {
+      el('authLoginHint').textContent = 'Too many attempts - try again in ' + loginBody.retry_after_s + 's.';
+    } else {
+      el('authLoginHint').textContent = 'Incorrect password.';
+    }
+  } catch (e) {
+    el('authLoginHint').textContent = 'Login failed: ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+el('authLoginPassword').addEventListener('keydown', function (ev) {
+  if (ev.key === 'Enter') { el('authLoginBtn').click(); }
+});
+
+el('authSetPasswordBtn').addEventListener('click', async function () {
+  var btn = this;
+  var pw1 = el('authNewPassword').value;
+  var pw2 = el('authNewPasswordConfirm').value;
+  if (pw1.length < 8) {
+    el('authSetPasswordHint').textContent = 'Password must be at least 8 characters.';
+    return;
+  }
+  if (pw1 !== pw2) {
+    el('authSetPasswordHint').textContent = 'Passwords do not match.';
+    return;
+  }
+  btn.disabled = true;
+  el('authSetPasswordHint').textContent = 'Setting password…';
+  try {
+    var saltRes = await fetch('/api/auth/new-salt', { cache: 'no-store' });
+    if (saltRes.status === 401) { handleAuthExpiry(); return; }
+    var saltBody = await saltRes.json();
+    if (!saltRes.ok) {
+      el('authSetPasswordHint').textContent = 'Could not start password set - reload and try again.';
+      return;
+    }
+    var storedKey = gwCrypto.pbkdf2Sha256Hex(pw1, saltBody.salt, saltBody.iterations, 32);
+    var setRes = await fetch('/api/auth/password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ stored_key: storedKey })
+    });
+    if (setRes.status === 401) { handleAuthExpiry(); return; }
+    if (setRes.ok) {
+      el('authNewPassword').value = '';
+      el('authNewPasswordConfirm').value = '';
+      showApp();
+    } else {
+      var errBody = await setRes.json().catch(function () { return {}; });
+      el('authSetPasswordHint').textContent = errBody.error === 'no_pending_salt'
+        ? 'Timed out - try again.'
+        : 'Could not set password.';
+    }
+  } catch (e) {
+    el('authSetPasswordHint').textContent = 'Failed: ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+async function initAuth() {
+  try {
+    var res = await fetch('/api/auth/status', { cache: 'no-store' });
+    var s = await res.json();
+    if (s.authenticated) {
+      showApp();
+      return;
+    }
+    showAuthScreen(s.password_set ? 'login' : 'set-password');
+  } catch (e) {
+    showAuthScreen('login', 'Could not reach the node - check your connection and reload.');
+  }
+}
+
+initAuth();
 </script>
 
 </body>
