@@ -101,9 +101,12 @@ see `design/ROADMAP.md` for current status).
 - **`CONFIG_HALOW_COUNTRY_CODE`** is fixed at `"US"` - the only domain this module's 902-928 MHz
   front end and its BCF support - so the Pi's HaLow radio has to be on US too. It's a build-time
   Kconfig value, not something `gwcfg-*` can set at runtime.
-- Nothing has been flashed or run on physical hardware - a compiling build isn't a working
-  radio link. Association/DHCP/NAT/CoT-relay behavior on real Pi + XIAO hardware is still
-  unverified (`design/HARDWARE.md` Part 2 walks through proving each one).
+- **First hardware bring-up is under way, but only XIAO-to-XIAO so far - no Pi has been tested
+  yet.** SoftAP/DHCP and the HaLow radio itself are confirmed on a real XIAO ESP32-S3 + WM6108
+  (`design/ROADMAP.md` checklist steps 1 and 4), and a relay+leaf pair (two XIAOs, no Pi) has
+  passed association, NAT, DNS forwarding and CoT relay traffic end to end. Association/DHCP/NAT
+  against a real Pi is still unverified (`design/HARDWARE.md` Part 2 walks through proving each
+  one) - see `design/ROADMAP.md` for exactly what's confirmed and what isn't.
 - **Web UI authentication is built and confirmed on hardware; OTA delivery is not.** The config
   page forces a password on first use (no default/shared login) - see `design/ROADMAP.md` "Not
   built yet" item 1. OTA was blocked on auth landing first and is next.
@@ -193,9 +196,11 @@ never a separate build. Every image carries both roles' code; `role` just picks 
   field-deployed leaf still gets HaLow's actual range to reach the relay; only the relay's own
   uplink hop rides short-range Wi-Fi. Two XIAOs and no Pi at all is a legitimate deployment on its
   own - a HaLow Wi-Fi extender, not only an OpenMANET compatibility shim. See `design/ROADMAP.md`
-  item 8 for the full design and its current status: **built and `idf.py build`-verified, not yet
-  proven on real hardware** - Morse Micro's own HaLow AP-mode API is marked alpha. Bring-up runbook
-  (tiered, cheapest first, no Pi needed for the first two tiers): `design/HARDWARE.md` Part 3.
+  item 8 for the full design and its current status: **bench-confirmed on real hardware** - a relay
+  and leaf pair associate, NAT and the CoT relay come up behind the HaLow AP downlink, and CoT
+  passes with 0% loss over a 2000-packet burst - but not yet against a real Pi, and Morse Micro's
+  own HaLow AP-mode API this relies on is still marked alpha. Bring-up runbook (tiered, cheapest
+  first, no Pi needed for the first two tiers): `design/HARDWARE.md` Part 3.
 
 #### Setting up a relay + leaf pair
 
@@ -308,13 +313,19 @@ main/
 ├── uplink_halow.c       HaLow STA uplink via morsemicro/halow, reconnect/backoff, scan, RSSI (client role)
 ├── downlink_softap.c    local 2.4GHz SoftAP + DHCP for phones/tablets/ATAK devices (client role)
 ├── uplink_wifi.c        native 2.4GHz esp_wifi STA uplink to the Pi's local AP (relay role)
-├── downlink_halow_ap.c  HaLow radio in AP mode for other XIAOs to join (relay role) - untested on hardware
+├── downlink_halow_ap.c  HaLow radio in AP mode for other XIAOs to join (relay role) - confirmed on
+                        real hardware (leaf associates, NAT + CoT relay come up behind it)
+├── dns_forward.c        DNS forwarding on the relay's downlink for statically-addressed HaLow leaves
 ├── ip_forward_nat.c     DNS propagation + uplink as default route + NAPT on the downlink netif
 ├── cot_relay.c          ATAK CoT multicast relay (239.2.3.1:6969) between both netifs
 ├── status_led.c         on-board LED as a link-state indicator (no cable, no phone needed)
 ├── factory_reset.c      BOOT-button hold restores default config
 ├── log_buffer.c         in-RAM ring of recent logs, served at /api/log
 ├── task_stats.c         per-task stack headroom, served at /api/tasks and by gwcfg-tasks
+├── chip_temp.c          ESP32-S3 die temperature, surfaced in /api/status
+├── link_history.c       30s-sampled RSSI history ring for the web UI's uplink sparkline
+├── heap_guard.c         PSRAM + combined-heap monitor; sheds CoT then pauses SoftAP DHCP under pressure
+├── auth.c               challenge-response web UI login: sessions, lockout, first-use password set
 ├── web_ui.c             on-device HTTP config UI, SoftAP clients only (same NVS config as gwcfg-*)
 ├── web_ui.html          embedded into the firmware image, not a separate filesystem
 └── minify_web_ui.py     build step: strips comments/indentation from the *embedded copy* of

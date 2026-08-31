@@ -148,9 +148,12 @@ again in place; there is no separate step for this.
       forwards 239.2.3.1 at all. Multicast over mesh routing is a classic silent-drop point and
       fails identically to a broken relay — isolate them or you can't tell which is at fault.
 - [ ] **Step 6** — CoT relay validated: ATAK on a phone sees mesh CoT and vice versa.
-- [ ] **Step 7** — Web UI authentication. **Not a bench step** — development work, listed here
-      because it gates shipping and OTA delivery, so it has no entry in the runbook. Design settled
-      below; not started.
+- [x] **Step 7** — Web UI authentication. **Not a bench step** — development work, listed here
+      because it gates shipping and OTA delivery, so it has no entry in the runbook. **Implemented
+      and confirmed on real hardware 2026-08-30** — challenge-response login, forced password-set on
+      first use, lockout/backoff, `gwcfg-reset-auth` recovery. See item 1 under "Not built yet" for
+      the full design and what's still only exercised in the lab (mobile-browser PBKDF2 timing,
+      session-idle timeout, the lockout's later backoff windows).
 
 ## Not built yet
 
@@ -425,21 +428,32 @@ real hardware. Procedure and pass/fail criteria for each is in
 [`HARDWARE.md`](HARDWARE.md) Part 3 - same relationship as the main checklist above has to
 `HARDWARE.md` Part 2: this is the tracker, that is the runbook.
 
-- [ ] **Tier 0** - does `mmhalow_wifi_start()` actually bring the HaLow AP up on air at all (it
+- [x] **Tier 0** - does `mmhalow_wifi_start()` actually bring the HaLow AP up on air at all (it
       returns `void`, so `downlink_halow_ap_is_started()` only means "we called it," not
       confirmation)? Two XIAOs, no Pi, no Wi-Fi network needed - the cheapest, most isolated check
-      of the alpha AP-mode API by itself.
-- [ ] **Tier 1** - does a leaf's `gwcfg-set-uplink` against that AP actually associate, and does the
+      of the alpha AP-mode API by itself. **Passed, confirmed on real hardware 2026-08-30** — see
+      "Sixth Aug 30 finding" below: a leaf's `gwcfg-scan` finds the relay's HaLow AP with a real
+      RSSI and frequency, repeated at two different bandwidths.
+- [x] **Tier 1** - does a leaf's `gwcfg-set-uplink` against that AP actually associate, and does the
       static-IP-on-both-ends addressing scheme (no DHCP server on a relay's HaLow AP - see
       `main/downlink_halow_ap.h`) actually pass traffic once associated? **Note this could not have
       passed before**: `use_static_ip` was stored and validated but never applied to the netif, so
       the leaf ran a DHCP client against an AP with no DHCP server. Fixed — `apply_static_ip()` in
-      `main/uplink_halow.c`, which is also where the derivation lives. Untested on hardware, so
-      treat a Tier 1 failure as a real result rather than assuming this fix settled it.
+      `main/uplink_halow.c`, which is also where the derivation lives. **Passed, confirmed on real
+      hardware 2026-08-30**: a leaf given a static IP with `gwcfg-set-uplink-static-ip` reassociates
+      and reaches `uplink state: up`, and shows up on the relay's own `halow ap stas` count — see
+      "Fifth" and "Sixth Aug 30 finding" below.
 - [ ] **Tier 2** - the full chain against *any* ordinary Wi-Fi network on the relay's uplink side
       (still no Pi needed) - first real-hardware run of the NAT/DNS/CoT-relay pipeline at all.
       **Attempted 2026-08-17 against an ordinary WPA3-SAE home AP.** The uplink half passed and the
       datapath half found a bug; both are recorded under "What the first relay run proved" below.
+      **Substantially advanced 2026-08-30**, not yet complete: the VIF-ID bug that dropped
+      downlink-bound multicast/replies is root-caused and worked around (0/6 → 6/6 packets
+      forwarded, verified), and DNS forwarding for statically-addressed leaves is implemented and
+      confirmed to start/bind — see "Third" through "Fifth Aug 30 finding" below. **Still open**: an
+      actual DNS query/response round-trip and real browsing from a phone behind a leaf, which needs
+      a device on a leaf's own SoftAP that this project's dev machine has no network path to. Don't
+      tick this box until that's confirmed.
 - [ ] **Tier 3** - the actual target scenario: swap "any Wi-Fi network" for the Pi's own local AP.
       Only meaningful once item 0's AP-mode workaround is confirmed on the real Pi.
 
@@ -1063,8 +1077,6 @@ Recorded so they don't get "fixed" by accident.
   `GW_CONFIG_VERSION` bump and a second copy of `apply_static_ip()`'s derivation — do it only if a
   Pi turns up with no DHCP server on that interface.
 - **No captive-portal DNS redirect.** A real UX gap, not a defect. See item 4 above.
-- **No web UI authentication.** See item 1. The SoftAP passphrase plus the subnet check (and the
-  interim Host/Content-Type CSRF guards) is the current boundary.
 - **The web UI cannot clear a stored passphrase or switch the SoftAP to open.** A blank password
   field means "keep current" - `GET /api/config` never echoes passphrases back, so an empty field
   can't be distinguished from "clear it", and "keep" is the safe reading. The console can do it:

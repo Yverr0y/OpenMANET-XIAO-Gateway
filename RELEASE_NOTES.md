@@ -44,11 +44,12 @@ An on-device, fully embedded responsive web application accessible offline over 
 * **Services**: Callsign / Node ID identification and ATAK CoT multicast group/port settings.
 * **Live Log Console**: In-RAM ring log reader with 3-second auto-refresh and one-click clipboard copy.
 * **Docked HUD Action Bar**: Persistent bottom action bar for immediate configuration saving and reboot triggering.
+* **Authentication**: Every endpoint sits behind a challenge-response login (client-side PBKDF2-HMAC-SHA256, server-side session cookie) with a forced password-set on first use — no default or shared credential ships on the device.
 
 ### 4. Serial REPL & Provisioning CLI (`xiao-gw>`)
 Accessible over the native USB-C port (`115200 8N1`):
-* Interactive commands: `gwcfg-status`, `gwcfg-scan`, `gwcfg-set-role`, `gwcfg-radio`, `gwcfg-set-uplink`, `gwcfg-set-softap`, `gwcfg-set-cot`, `gwcfg-save`, `gwcfg-reset-defaults`, and `gwcfg-reboot`.
-* **Hardware Recovery**: Holding the physical **BOOT button** on power-up executes a safe factory reset back to default client configuration.
+* Interactive commands (18 total): `gwcfg-status`, `gwcfg-scan`, `gwcfg-set-role`, `gwcfg-radio`, `gwcfg-set-uplink`, `gwcfg-set-softap`, `gwcfg-set-node`, `gwcfg-save`, `gwcfg-reset`, `gwcfg-tasks`, and more — `gwcfg-show` lists live config, `help` lists every command.
+* **Hardware Recovery**: Holding the physical **BOOT button for 5 seconds while the node is running** (not at power-up — that enters the ROM bootloader instead) executes a safe factory reset back to default client configuration.
 
 ### 5. Web Flasher & Release Automation
 * **Browser-Based Flashing**: WebUSB-powered flasher using ESP Web Tools (Chrome/Edge compatible) requiring zero software installation.
@@ -79,10 +80,12 @@ Offset      Size      Partition Name       Content
 ─────────────────────────────────────────────────────────────────────────────
 0x00000000  32 KB     bootloader           Second stage ESP-IDF bootloader
 0x00008000   4 KB     partition_table      Custom dual-OTA partition table
-0x00009000  16 KB     nvs                  NVS configuration storage (GWCF v4)
+0x00009000  24 KB     nvs                  NVS configuration storage (GW_CONFIG_VERSION 7)
+0x0000F000   4 KB     phy_init             Wi-Fi/BT PHY calibration data
 0x00010000   8 KB     otadata              Active OTA boot slot state
-0x00020000  1.5 MB    ota_0 (app)          Primary firmware application
-0x001A0000  1.5 MB    ota_1 (app)          Secondary OTA update slot
+0x00020000  3 MB      ota_0 (app)          Primary firmware application
+0x00320000  3 MB      ota_1 (app)          Secondary OTA update slot
+0x00620000  64 KB     coredump             Panic backtrace, read with `idf.py coredump-info`
 ```
 
 ---
@@ -96,11 +99,15 @@ Offset      Size      Partition Name       Content
 
 ### 2. First-Time Configuration
 1. Power up the device. Connect your phone or laptop to the default Wi-Fi network:
-   * **SSID:** `XIAO-HaLow-GW`
-   * **Password:** *(Open / None by default)*
+   * **SSID:** `xiao-gateway-xxxx` (`xxxx` is four hex characters from that unit's factory-burned
+     MAC address, so every node ships with a different, stable name)
+   * **Password:** `openmanet`
 2. In your browser, navigate to:
    ```
    http://172.16.50.1
    ```
-3. Set your **Node Callsign**, select your **Node Role**, configure your **Mesh Uplink credentials** (or scan airwaves in the Wireless tab), set a secure **Wi-Fi Password**, and click **Save Config** $\rightarrow$ **Reboot Node**.
-4. Open ATAK on your connected device; multicast CoT traffic is bridged automatically.
+3. **First visit only:** the page forces you to set an admin password before anything else works —
+   there's no default or shared login. Choose one you'll remember; a lost password means a factory
+   reset (5-second BOOT-button hold), which also wipes your uplink/SoftAP config back to defaults.
+4. Set your **Node Callsign**, select your **Node Role**, configure your **Mesh Uplink credentials** (or scan airwaves in the Wireless tab), set a secure **Wi-Fi Password**, and click **Save Config** $\rightarrow$ **Reboot Node**.
+5. Open ATAK on your connected device; multicast CoT traffic is bridged automatically.

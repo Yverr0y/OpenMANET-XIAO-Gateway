@@ -65,9 +65,10 @@ idf.py build
 - CI builds every push to `main` and every PR (one US build — see the region note below), in the
   official `espressif/idf` Docker image.
 
-Current baseline: zero errors, zero warnings, binary ~1.74 MB (`0x1be2f0`), 42% free in the 3 MB app
+Current baseline: zero errors, zero warnings, binary ~1.77 MB (`0x1c6100`), 41% free in the 3 MB app
 slot. That is 178 KB below the ~1.92 MB / 36% it sat at through the GW_ROLE_RELAY work, from `-Os`
-(~145 KB) plus the gzipped web UI (33,694 bytes) - see `design/ROADMAP.md` "Status at a glance".
+(~145 KB) plus the gzipped web UI (33,694 bytes) - see `design/ROADMAP.md` "Status at a glance". (The
+1% since taken back is PSRAM init code + `heap_guard.c`, noise next to the margin this slot has.)
 
 ## Things that look like cleanup but aren't
 
