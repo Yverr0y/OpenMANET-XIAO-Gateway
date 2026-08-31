@@ -104,8 +104,9 @@ see `design/ROADMAP.md` for current status).
 - Nothing has been flashed or run on physical hardware - a compiling build isn't a working
   radio link. Association/DHCP/NAT/CoT-relay behavior on real Pi + XIAO hardware is still
   unverified (`design/HARDWARE.md` Part 2 walks through proving each one).
-- **No web UI authentication and no OTA delivery.** Both are designed, neither is built, and the
-  first blocks the second - see `design/ROADMAP.md`.
+- **Web UI authentication is built and confirmed on hardware; OTA delivery is not.** The config
+  page forces a password on first use (no default/shared login) - see `design/ROADMAP.md` "Not
+  built yet" item 1. OTA was blocked on auth landing first and is next.
 
 ## Building
 
