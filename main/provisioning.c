@@ -15,6 +15,7 @@
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "lwip/inet.h"
 #include "nvs.h"
 #include "nvs_flash.h"
@@ -794,12 +795,71 @@ static int cmd_gwcfg_status(int argc, char **argv)
     }
 
     printf("cot relay     : %s\n", cot_relay_is_running() ? "running" : "not started");
+    if (cot_relay_is_running()) {
+        cot_relay_counters_t uplink_side, downlink_side;
+        cot_relay_get_counters(&uplink_side, &downlink_side);
+        printf("cot uplink    : rx %" PRIu32 " pkt (%" PRIu64 " B)  tx %" PRIu32 " pkt (%" PRIu64
+               " B)\n",
+               uplink_side.rx_packets, uplink_side.rx_bytes, uplink_side.tx_packets,
+               uplink_side.tx_bytes);
+        printf("cot downlink  : rx %" PRIu32 " pkt (%" PRIu64 " B)  tx %" PRIu32 " pkt (%" PRIu64
+               " B)\n",
+               downlink_side.rx_packets, downlink_side.rx_bytes, downlink_side.tx_packets,
+               downlink_side.tx_bytes);
+    }
     printf("country code  : %s (build-time, not settable here)\n", CONFIG_HALOW_COUNTRY_CODE);
     printf("free heap     : %u bytes\n", (unsigned)esp_get_free_heap_size());
     /* Internal SRAM alone - see heap_guard.h for why this is worth printing
      * separately from the line above once CONFIG_SPIRAM_USE_MALLOC=y makes
      * that figure a combined internal+PSRAM number. */
     printf("free heap (internal): %u bytes\n", (unsigned)esp_get_free_internal_heap_size());
+    return 0;
+}
+
+/* Bench-test helper: fires a burst of small datagrams into the CoT multicast
+ * group via cot_relay_inject() - the same "generic send primitive the
+ * self-beacon will need" cot_relay.h already documents as existing for
+ * exactly this kind of caller, just not yet consumed by anything. Sends on
+ * *this* node's own interfaces (both uplink and downlink), so run it on
+ * whichever node is upstream of the link being tested and read the loss off
+ * the *other* node's `cot uplink`/`cot downlink` rx counters above -
+ * cot_relay_inject() itself has no delivery confirmation (it's UDP
+ * multicast), so "sent" here only means the socket call succeeded, not that
+ * it arrived. Blocks the console for roughly count*interval_ms - deliberate,
+ * this is an attended bench command, not something a script should loop on a
+ * timer. */
+static int cmd_gwcfg_cot_test(int argc, char **argv)
+{
+    if (argc != 3) {
+        printf("usage: gwcfg-cot-test <count> <interval_ms>\n"
+               "  Injects <count> small test datagrams into the CoT multicast group,\n"
+               "  <interval_ms> apart, via cot_relay_inject(). Read the loss off the\n"
+               "  *other* node's 'cot uplink'/'cot downlink' rx counters (gwcfg-status).\n");
+        return 1;
+    }
+    if (!cot_relay_is_running()) {
+        printf("CoT relay not running on this node - nothing to inject through\n");
+        return 1;
+    }
+
+    int count = atoi(argv[1]);
+    int interval_ms = atoi(argv[2]);
+    if (count <= 0 || count > 10000 || interval_ms < 0) {
+        printf("count must be 1-10000, interval_ms must be >= 0\n");
+        return 1;
+    }
+
+    static const char payload[] = "GWCFG-COT-TEST-PACKET";
+    int sent = 0;
+    for (int i = 0; i < count; i++) {
+        if (cot_relay_inject(payload, sizeof(payload) - 1) == ESP_OK) {
+            sent++;
+        }
+        if (interval_ms > 0) {
+            vTaskDelay(pdMS_TO_TICKS(interval_ms));
+        }
+    }
+    printf("injected %d/%d test datagrams (socket-accepted, not delivery-confirmed)\n", sent, count);
     return 0;
 }
 
@@ -1034,6 +1094,7 @@ esp_err_t provisioning_register_console_commands(gw_config_t *cfg)
         { .command = "gwcfg-reset", .help = "Reset in-RAM config to built-in defaults", .hint = NULL, .func = &cmd_gwcfg_reset },
         { .command = "gwcfg-reset-auth", .help = "Clear the web UI admin credential and drop sessions immediately (no reboot)", .hint = NULL, .func = &cmd_gwcfg_reset_auth },
         { .command = "gwcfg-status", .help = "Show live uplink/relay state, RSSI and IPs", .hint = NULL, .func = &cmd_gwcfg_status },
+        { .command = "gwcfg-cot-test", .help = "Bench test: inject <count> CoT datagrams <interval_ms> apart; read loss off the other node's counters", .hint = NULL, .func = &cmd_gwcfg_cot_test },
         { .command = "gwcfg-scan", .help = "Scan for HaLow APs on this build's channel list", .hint = NULL, .func = &cmd_gwcfg_scan },
         { .command = "gwcfg-list-halow-channels", .help = "List legal (op_class, s1g_chan_num) pairs for gwcfg-set-halow-ap", .hint = NULL, .func = &cmd_gwcfg_list_halow_channels },
         { .command = "gwcfg-radio", .help = "Print HaLow BCF/firmware versions (proves SPI works)", .hint = NULL, .func = &cmd_gwcfg_radio },

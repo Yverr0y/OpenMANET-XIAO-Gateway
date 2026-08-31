@@ -89,7 +89,7 @@ callback, check which task will run it and what stack that task has.
 | Wi-Fi STA uplink | `main/uplink_wifi.c` | GW_ROLE_RELAY only - native `esp_wifi` STA joining the Pi's own local AP directly (item 8 below). Same link-state/RSSI/callback shape as `uplink_halow.c`, event-driven reconnect against standard ESP-IDF STA events rather than a blocking task. |
 | HaLow AP downlink | `main/downlink_halow_ap.c` | GW_ROLE_RELAY only - HaLow radio in AP mode (`CONFIG_HALOW_AP_MODE`) so other XIAOs can associate to this node instead of a Pi (item 8 below). Static IP, no DHCP server - see the file's own header comment for why. Also exposes the regulatory channel table so an operator can pick a legal (op_class, s1g_chan_num) pair. **Confirmed on real hardware as of 2026-08-30**: starts cleanly, a leaf XIAO associates over HaLow, the downlink netif reports up (fixed - see "What the Aug 30 datapath-race run proved" below), and NAT + the CoT relay both come up behind it. `mmhalow_wifi_start()` itself still returns no code to confirm the AP came up (hence `gwcfg-status`'s "best-effort" wording for that one specific claim), but everything downstream of it now has independent confirmation. `mmwlan_tx_pkt` used to intermittently log "Unable to infer VIF ID" for outbound frames toward a leaf, confirmed 2026-08-30 to actually block real CoT delivery *and* all NAT'd internet reply traffic through the mesh, not just IGMP housekeeping - see "Third" and "Fourth Aug 30 finding" below. **Worked around locally as of 2026-08-30** (`patch_vendored_halow.py`, applied automatically at CMake configure time) - verified 0/6 -> 6/6 packets forwarded across the fix. Morse's own AP-mode API is still marked alpha, and this remains a bug filed with them, not a real upstream fix. |
 | NAT / IP forwarding | `main/ip_forward_nat.c` | All three steps of ESP-IDF's NAT recipe: DNS propagation into the SoftAP's DHCP offers, uplink as default route, NAPT on the downlink. |
-| CoT multicast relay | `main/cot_relay.c` | One socket joined to 239.2.3.1:6969 on both netifs, `IP_PKTINFO`/`recvmsg()` for arrival interface, loop prevention via `IP_MULTICAST_LOOP` off + own-source drop. Tracks per-side rx/tx packet and byte counters (`cot_relay_get_counters()`), surfaced in `/api/status`'s `cot.uplink_side`/`cot.downlink_side` - groundwork for a real throughput number once traffic is flowing. Deliberately not a generic per-netif counter - see `cot_relay_counters_t`'s doc comment for why lwIP's MIB2 stats aren't reachable from application code here. |
+| CoT multicast relay | `main/cot_relay.c` | One socket joined to 239.2.3.1:6969 on both netifs, `IP_PKTINFO`/`recvmsg()` for arrival interface, loop prevention via `IP_MULTICAST_LOOP` off + own-source drop. Tracks per-side rx/tx packet and byte counters (`cot_relay_get_counters()`), surfaced in `/api/status`'s `cot.uplink_side`/`cot.downlink_side` - groundwork for a real throughput number once traffic is flowing. Deliberately not a generic per-netif counter - see `cot_relay_counters_t`'s doc comment for why lwIP's MIB2 stats aren't reachable from application code here. Counters also printed by `gwcfg-status` now, and `cot_relay_inject()` gets its first real caller via the `gwcfg-cot-test <count> <interval_ms>` bench command - see the Seventh Aug 30 finding below for what it's for. |
 | Uplink RSSI history | `main/link_history.c` | Samples the active uplink's RSSI every 30s into a 240-sample (2h) ring, served at `/api/rssi-history` and drawn as a sparkline in the web UI's uplink card. Role-agnostic - tries both `uplink_halow_get_rssi()` and `uplink_wifi_get_rssi()` each tick and keeps whichever isn't reporting its idle sentinel. **Confirmed on real hardware 2026-08-30, with a caveat**: on a GW_ROLE_CLIENT leaf associated to a relay's HaLow AP, `uplink_halow_get_rssi()` reads a flat 0 dBm rather than a real value - see "Second Aug 30 finding" below the datapath-race section. The relay's own Wi-Fi-uplink RSSI (`uplink_wifi_get_rssi()`) reads correctly. |
 | Web UI authentication | `main/auth.c` / `.h` | Challenge-response login, RAM-only sessions, lockout/backoff, and the first-use/change password flow behind six new endpoints in `main/web_ui.c` - see item 1 under "Not built yet" for the full design and what's still pending hardware verification. |
 | DNS forwarding for HaLow leaves | `main/dns_forward.c` | GW_ROLE_RELAY only - a leaf's statically-addressed uplink has no DHCP lease to learn a DNS server from at all (`gw_uplink_config_t.static_dns`'s own comment), so this listens on the relay's own downlink (HaLow AP) address, port 53, and forwards queries out through the relay's own uplink using whatever real DNS server *that* hop actually has (read fresh via `esp_netif_get_dns_info()` per query, not cached - tracks a lease renewal automatically). Single task, `select()` over a listen socket and an upstream socket, an 8-slot pending-query table keyed by DNS transaction ID. A leaf points at it via `gwcfg-set-uplink-static-ip <ip> <gateway> <netmask> <relay's-own-downlink-ip>`. **Confirmed on real hardware 2026-08-30**: forwarder starts and binds correctly (`DNS forwarder listening on 172.16.60.1:53`); the actual query/response round-trip needs a device on a leaf's own SoftAP to test, which this project's own dev machine has no network path to - see the Fifth Aug 30 finding below for why this exists at all. |
@@ -818,11 +818,35 @@ either way.
 "Second Aug 30 finding" flat-RSSI issue below, reproduced again here on both firmware builds. This
 finding doesn't touch that one; they just share a scan.
 
-One operational note from the same session: running `gwcfg-scan` from an already-associated leaf
-knocked its own uplink association loose (`HaLow uplink dropped, will reassociate` immediately
-after the scan printed results) both times. Not investigated further here - filed as a "scanning
-while associated has a cost" observation, not a bug report, since the leaf's own reconnect logic
-recovered on its own both times.
+#### Seventh Aug 30 finding: no measurable CoT loss from a 1W MeshCore repeater 30ft away
+
+Raised as a real-world coexistence question: the bench pair sits roughly 30ft from an active
+MeshCore repeater (LoRa, 902-928MHz, same license-exempt band) running at 1W on its US/Canada
+default preset - 910.525MHz, BW62.5kHz, fixed frequency (not hopping). With the relay's HaLow AP on
+915.000MHz/2MHz (see the Sixth Aug 30 finding above), that's roughly a 3.4MHz clean gap between the
+two systems' actual occupied spectrum - no co-channel overlap - but proximity/power alone can still
+matter (front-end desensitization, raised noise floor) even without direct overlap, so this was
+worth measuring rather than assuming.
+
+**Method**: a new bench-only console command, `gwcfg-cot-test <count> <interval_ms>`
+(`main/provisioning.c`), calls the existing `cot_relay_inject()` (previously unused - `cot_relay.h`
+already documented it as "the generic send primitive the self-beacon will need," this is its first
+real caller) to fire a burst of small datagrams into the CoT multicast group from one node, read
+against the *other* node's rx counters (now also printed by `gwcfg-status`, alongside the existing
+`/api/status` exposure) - `cot_relay_inject()` has no delivery confirmation of its own (UDP
+multicast), so the receiving node's counter is the only real signal.
+
+**Result**: two runs, both 0% loss. 200 packets at 50ms spacing (10s) and 2000 packets at 20ms
+spacing (~40s), both injected from the leaf and landing in full on the relay's `cot downlink` rx
+counter (200/200, then 2000/2000 more on top). MeshCore repeater running normally throughout, not
+specially triggered.
+
+**Caveats worth keeping**: this doesn't prove the repeater was actively transmitting for the full
+window - LoRa repeaters aren't continuously keyed, so a clean result partly reflects real traffic
+timing on their mesh, not just RF physics. It also doesn't test range: both nodes were still close
+together (near each other, both near the repeater), so this confirms *coexistence at short range*,
+not *link margin under coexistence at longer range* - see the range-test discussion opened the same
+day for the natural next step.
 
 ### 9. Persistent log storage and expanded config — scoping notes (2026-08-30)
 
