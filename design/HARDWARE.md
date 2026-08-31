@@ -9,7 +9,7 @@ failure looks like a software problem.
 
 - Companion docs: [`ROADMAP.md`](ROADMAP.md) (status, what's next),
   [`PI_SIDE.md`](PI_SIDE.md) (the other end of the link)
-- **Last updated:** 2026-08-06
+- **Last updated:** 2026-08-30
 
 ---
 
@@ -581,7 +581,9 @@ and re-associates. Check the Pi is actually serving that interface.
 Can be done at any time — it doesn't depend on the uplink — and it's the natural first hardware
 test.
 
-1. Join the node's Wi-Fi (`xiao-gateway` / `openmanet` by default).
+1. Join the node's Wi-Fi (`xiao-gateway-xxxx` / `openmanet` by default — `xxxx` is four hex
+   characters from that unit's factory-burned MAC, so it's unique per node; see
+   `main/provisioning.c`).
 2. You should get a `172.16.50.x` address.
 3. Browse to `http://172.16.50.1/`.
 

@@ -407,18 +407,30 @@
 
 <h2>After flashing</h2>
 <ol class="steps">
-  <li><span>The device boots and starts its own Wi-Fi access point (default SSID <code>xiao-gateway</code>,
-      password <code>openmanet</code> — see the firmware's
-      <a href="https://github.com/d3mocide/OpenMANET-XIAO-Gateway/blob/main/main/provisioning.c">defaults</a>
-      if these have changed).</span></li>
+  <li><span>The device boots and starts its own Wi-Fi access point. Default SSID is
+      <code>xiao-gateway-xxxx</code>, password <code>openmanet</code> — <code>xxxx</code> is four hex
+      characters from that specific unit's factory-burned MAC address, so every fresh node gets a
+      different, stable name out of the box rather than colliding with other units nearby (see the
+      firmware's
+      <a href="https://github.com/d3mocide/OpenMANET-XIAO-Gateway/blob/main/main/provisioning.c">defaults</a>).</span></li>
   <li><span>Connect your laptop or phone to that Wi-Fi network.</span></li>
   <li><span>Browse to <code>http://172.16.50.1/</code> — the on-device config page.</span></li>
+  <li><span><strong>First visit only:</strong> the page forces you to set an admin password before
+      anything else works — there is no default or shared login. Choose one you'll remember; the
+      only way back in if you lose it is the factory-reset button below, which also wipes your
+      uplink/SoftAP config back to placeholders.</span></li>
   <li><span>Use the config page's <strong>Scan for HaLow APs</strong> button to find the mesh Pi's
       access point, then click the result to fill in its SSID.</span></li>
   <li><span>Set the uplink security/passphrase (open/OWE/SAE only — see the
       <a href="https://github.com/d3mocide/OpenMANET-XIAO-Gateway/blob/main/design/PI_SIDE.md">Pi-side reference</a>
       for what the mesh Pi expects) and your own local Wi-Fi SSID/password, then Save and Reboot.</span></li>
 </ol>
+<p>
+  The same firmware image can also run as a <strong>relay</strong> node (HaLow AP downlink + Wi-Fi
+  uplink to the Pi, so other XIAO nodes associate to it instead of the Pi directly) — switch to it
+  from the config page's Node → Role field or <code>gwcfg-set-role relay</code> over serial. The
+  default out of the box is the client role described above.
+</p>
 
 <h2>Reading the on-board LED</h2>
 <p>
