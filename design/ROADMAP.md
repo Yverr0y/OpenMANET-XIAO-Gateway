@@ -6,7 +6,8 @@ you're picking the project back up.**
 - Companion docs: [`HARDWARE.md`](HARDWARE.md) (what to buy, how to build one, how to bring it up),
   [`PI_SIDE.md`](PI_SIDE.md) (the other end of the link)
 - Architecture diagram and repo layout: [`../README.md`](../README.md)
-- **Last updated:** 2026-08-30 (web UI authentication implemented - item 1)
+- **Last updated:** 2026-08-30 (PSRAM + heap-pressure shedding, 1-2MHz HaLow bandwidth confirmed on
+  hardware, MeshCore coexistence tested clean at short range - range test planned, not yet run)
 
 Keep this file current: tick the checklist when a step passes, move an item out of "not built yet"
 when it lands, and add to "settled decisions" rather than re-arguing one. Historical detail
@@ -845,8 +846,35 @@ specially triggered.
 window - LoRa repeaters aren't continuously keyed, so a clean result partly reflects real traffic
 timing on their mesh, not just RF physics. It also doesn't test range: both nodes were still close
 together (near each other, both near the repeater), so this confirms *coexistence at short range*,
-not *link margin under coexistence at longer range* - see the range-test discussion opened the same
-day for the natural next step.
+not *link margin under coexistence at longer range*.
+
+**Planned next, not yet run**: a real range test, discussed the same day but deferred to a later
+session. Leaf stays wired to the dev machine (it has no route back to it anyway - static IP on an
+isolated 172.16.60.x subnet, confirmed unreachable from here regardless of cabling); the relay moves
+to the porch, co-located with the actual MeshCore repeater for the harder coexistence case at real
+distance, on 6dBi antennas in place of stock on both nodes. Three open items to settle before
+running it, captured here so they aren't re-derived from scratch:
+
+1. **Reading the relay once it's off USB.** This dev machine can already reach the relay's
+   home-network IP directly (`192.168.50.117` answered both ping and a plain HTTP GET) - so if its
+   Wi-Fi uplink still reaches the home AP from the porch, `/api/status` is reachable *if* the web UI
+   login is available for the session (it's behind auth now - see item 1 below). Otherwise, reading
+   `gwcfg-status`-equivalent numbers means checking the relay's web UI from a phone on-site and
+   reporting them back.
+2. **No RSSI signal to watch as distance increases** - the leaf's flat `0 dBm` HaLow RSSI (Second
+   Aug 30 finding) isn't fixed by any of this, so the range test is go/no-go plus the
+   `gwcfg-cot-test` loss percentage, not a link-budget curve.
+3. **6dBi antennas and the regulatory EIRP cap** - every regdb channel entry caps at 36dBm EIRP
+   (`mmregdb.c`) regardless of antenna. Whether the firmware's conducted power already accounts for
+   a specific antenna gain (and backs off for a higher-gain one) or transmits flat and trusts
+   whatever's connected is genuinely unverified - not chased down yet. Low stakes for a private bench
+   test, but worth reading `morselib`'s TX power path before treating a 6dBi swap as consequence-free
+   on a build meant to ship compliant. (Restated because it's easy to forget mid-swap: never power
+   the HaLow radio with no antenna attached, even briefly - risks the PA.)
+
+Test method once those are settled: same `gwcfg-cot-test <count> <interval_ms>` flow as the Seventh
+finding above, run from the leaf (stays reachable via USB regardless of where the relay ends up),
+read loss off the relay's `cot downlink` rx counter.
 
 ### 9. Persistent log storage and expanded config — scoping notes (2026-08-30)
 
