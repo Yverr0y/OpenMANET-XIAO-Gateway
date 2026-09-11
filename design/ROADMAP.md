@@ -11,13 +11,14 @@ you're picking the project back up.**
 - Companion docs: [`HARDWARE.md`](HARDWARE.md) (what to buy, how to build one, how to bring it up),
   [`PI_SIDE.md`](PI_SIDE.md) (the other end of the link)
 - Architecture diagram and repo layout: [`../README.md`](../README.md)
-- **Last updated:** 2026-09-11 (Stage B's F06, F07, F08 and F11 all landed, each scoped down from the
-  review's fuller design to the concrete, demonstrable bug within it - see Stage B below for what was
-  fixed vs. deliberately left open in each. F13 already landed earlier, so Stage B is now complete
-  except the fuller network-supervisor/config-store redesigns F08/F11 both intentionally deferred.
-  A separate P0 regression blocking the relay role's native Wi-Fi uplink, found while verifying F06,
-  is still open - see the item directly under F06 - though a shorter USB cable produced one clean,
-  sustained run and a powered hub is the next planned test)
+- **Last updated:** 2026-09-11 (Stage B complete - F06/F07/F08/F11/F13, each scoped down from the
+  review's fuller design to the concrete, demonstrable bug within it, see Stage B below for what was
+  fixed vs. deliberately left open in each. Stage C's F15 also landed, with a genuine hardware
+  before/after: the old single-slot challenge bug was accidentally reproduced live during testing,
+  then confirmed fixed across four repeat runs after reflashing. A separate P0 regression blocking
+  the relay role's native Wi-Fi uplink, found while verifying F06, is still open - see the item
+  directly under F06 - though a shorter USB cable produced one clean, sustained run and a powered
+  hub is the next planned test)
 
 Keep this file current: tick the checklist when a step passes, move an item out of "not built yet"
 when it lands, and add to "settled decisions" rather than re-arguing one. Historical detail
@@ -504,7 +505,61 @@ errors, zero warnings, binary size unchanged at 41% free. Not yet verified on ha
       nodes came back at default config after cable reseating and had to be reprovisioned - a
       real-world case for F14's eventual "power loss during save recovers coherently" acceptance
       criterion, not a defect introduced here.
-- [ ] F15 — P2 — auth challenge state is single/global, not per-transaction
+- [x] F15 (challenge table + absolute session cap; credential-revision race checked and found already
+      safe) — P2 — auth challenge state is single/global, not per-transaction. **Verified the
+      review's three named issues individually rather than assuming all applied**: (1) a single
+      global `s_pending_challenge` meant a second client's `GET /api/auth/challenge` silently
+      replaced a first client's in-flight one - real, confirmed on hardware below; (2) a wrong/stale
+      nonce cleared whatever challenge happened to be pending, not necessarily the sender's own -
+      same root cause as (1), fixed by the same change; (3) sessions had only a sliding idle timeout,
+      no absolute cap, so a continuously-touched session (an auto-refreshing tab, say) never actually
+      expired - real, also confirmed below. A fourth concern the review raises - "recheck credential
+      revision before issuing a session so a concurrent local reset cannot authorize an old
+      verification result" - turned out to be **already handled correctly**: `auth_verify_login()`
+      reads `s_cfg->auth.stored_key` fresh, under the lock, at verify time, not a cached copy from
+      when the challenge was issued, so a password change mid-login makes the client's HMAC response
+      (computed against the *old* key) fail comparison against the *new* one - correctly rejected as
+      bad credentials, not incorrectly authorized. No fix needed there; confirmed by reading the code
+      rather than assumed.
+
+      Fixed (1)/(2) by replacing the single global challenge with a small table
+      (`s_pending_challenges[AUTH_CHALLENGE_MAX=4]`, `main/auth.c`), mirroring the existing
+      `s_sessions[]` table's own evict-oldest-when-full pattern (an expired-but-not-yet-reclaimed
+      slot counts as free, so a burst of abandoned challenges from one client can't evict a
+      different client's still-valid one ahead of its own TTL). `auth_verify_login()` now scans for
+      the *one* slot matching the submitted nonce and clears only that slot, never a shared one.
+      Fixed (3) by adding `issued_us` to `auth_session_t` alongside the existing `last_seen_us`, and
+      checking both in `auth_check_session()` - `AUTH_SESSION_ABSOLUTE_MAX_US` (12h) matches
+      `web_ui.c`'s existing cookie `Max-Age`, making that already-stated lifetime actually enforced
+      server-side instead of merely advisory (a client that simply keeps resending the same cookie
+      past its `Max-Age` wasn't previously stopped by anything on this end).
+
+      **Verified on real hardware with genuine before/after evidence, not just a clean build**: this
+      session already had network access to a physical relay node's HTTPS management API (the same
+      LAN as its Wi-Fi uplink), so a full test client was written in Python (`hashlib.pbkdf2_hmac` +
+      `hmac` - both stdlib, matching `web_ui.html`'s bundled client-side crypto exactly) to drive the
+      real onboarding-claim and login flows end to end, not just the console side. The first test run
+      landed on the node's *previous* firmware (F11's build - flashing the F15 build came after, not
+      before, by mistake) and reproduced the exact bug being fixed: issuing challenge A, then B, then
+      completing login with B, then attempting A failed - proof the old single-slot design really did
+      let one client's challenge silently clobber another's. Reflashing with the F15 build and
+      repeating the identical sequence four consecutive times all succeeded (both A and B
+      independently valid), confirmed via temporary diagnostic logging that A and B land in separate
+      table slots and are matched/cleared independently. The absolute session cap was verified the
+      same way: temporarily set to 5s (reverted after), a session was touched every 2s (which would
+      keep a pure idle-timeout session alive indefinitely) and still correctly expired at the 5s mark
+      regardless - `authenticated` flipped from `true` to `false` in `/api/auth/status` right on
+      schedule. Both diagnostics (log lines, the shortened constant) were reverted before the final
+      build; the relay node was confirmed still fully healthy afterward (Wi-Fi uplink, HaLow AP, CoT
+      relay all running) with the restored 12h constant.
+
+      **Left open, deliberately**: `AUTH_CHALLENGE_MAX`/`AUTH_SESSION_MAX` (both 4) are a fixed
+      bound, not the review's fuller "admission limits" with separate abuse-rate accounting; a
+      challenge-issuance flood still only competes for table slots, it isn't independently
+      rate-limited. Judged proportionate for a single-admin device already gated by
+      `reject_if_remote()` (only same-subnet clients can reach any of this) rather than built out
+      further.
+- [ ] F14 (migration portion) — P1 — schema-bump/corrupt-config paths can silently reset ownership
 - [ ] F14 (migration portion) — P1 — schema-bump/corrupt-config paths can silently reset ownership
 
 ### Stage D — multi-node forwarding (needs A/B)

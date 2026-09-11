@@ -28,6 +28,26 @@ static const char *TAG = "auth";
 #define AUTH_SALT_OFFER_TTL_US (120LL * 1000000LL)       /* generous - a human is typing */
 #define AUTH_SESSION_IDLE_US   (30LL * 60 * 1000000LL)   /* 30 minutes */
 
+/* Absolute cap on a session's lifetime regardless of activity - review
+ * finding F15 (design/PROJECT_REVIEW_2026-09-10.md): before this, a session
+ * kept continuously active (a dashboard tab left open and auto-refreshing,
+ * say) never actually expired, since AUTH_SESSION_IDLE_US only resets on
+ * every touch and nothing ever compared against when the session began. Set
+ * to match web_ui.c's own cookie Max-Age (43200s) rather than picking a new
+ * number - that value already states how long this project considers a
+ * session's whole lifetime reasonable; this just makes the server actually
+ * enforce it instead of leaving it advisory (a client that simply keeps
+ * resending the cookie past its stated Max-Age was previously not stopped by
+ * anything server-side). */
+#define AUTH_SESSION_ABSOLUTE_MAX_US (43200LL * 1000000LL) /* 12 hours */
+
+/* How many login challenges can be pending at once - "a phone plus a laptop
+ * plus headroom", same reasoning as AUTH_SESSION_MAX above. A challenge is
+ * requested and then either completed or abandoned well before a session
+ * would ordinarily need this many slots, so reusing the same figure is
+ * generous, not tight. */
+#define AUTH_CHALLENGE_MAX 4
+
 /* Stored per-credential in gw_auth_config_t.iterations rather than assumed
  * fixed, so this can be tuned later without stranding already-provisioned
  * devices - see gw_config.h's own comment. This is only the value handed out
@@ -47,7 +67,8 @@ static const char *TAG = "auth";
 typedef struct {
     bool in_use;
     char token_hex[AUTH_TOKEN_HEX_LEN + 1];
-    int64_t last_seen_us;
+    int64_t last_seen_us; /* sliding idle timeout - see AUTH_SESSION_IDLE_US */
+    int64_t issued_us;    /* fixed at creation - see AUTH_SESSION_ABSOLUTE_MAX_US */
 } auth_session_t;
 
 typedef struct {
@@ -65,16 +86,24 @@ typedef struct {
 
 static gw_config_t *s_cfg = NULL;
 
-/* Guards everything below - the session table, both single-slot pending
- * offers, and the lockout counters. Deliberately separate from
- * provisioning.c's s_cfg_lock, which is config-(NVS blob)-only; this state
- * is RAM-only and unrelated to gw_config_t mutation. gw_config_t's own
- * .auth fields are still read/written under provisioning_config_lock() at
- * the points that touch them, same as every other field. */
+/* Guards everything below - the session table, the challenge table, the
+ * single-slot pending password-salt offer, and the lockout counters.
+ * Deliberately separate from provisioning.c's s_cfg_lock, which is
+ * config-(NVS blob)-only; this state is RAM-only and unrelated to
+ * gw_config_t mutation. gw_config_t's own .auth fields are still read/written
+ * under provisioning_config_lock() at the points that touch them, same as
+ * every other field. */
 static SemaphoreHandle_t s_auth_lock = NULL;
 
 static auth_session_t s_sessions[AUTH_SESSION_MAX];
-static auth_pending_challenge_t s_pending_challenge;
+
+/* A small table rather than one global slot - see AUTH_CHALLENGE_MAX's own
+ * comment and challenge_issue_locked() below (review finding F15). Still
+ * just one pending password-salt offer (s_pending_salt): that one is only
+ * ever issued as part of the single, inherently-serial first-ownership
+ * onboarding flow (review finding F03), which has no equivalent
+ * multiple-concurrent-client scenario to protect against. */
+static auth_pending_challenge_t s_pending_challenges[AUTH_CHALLENGE_MAX];
 static auth_pending_salt_t s_pending_salt;
 
 static uint8_t s_fail_count = 0;
@@ -155,9 +184,54 @@ static void session_create_locked(char *token_hex_out)
         slot = oldest_idx;
     }
 
+    int64_t now = esp_timer_get_time();
     s_sessions[slot].in_use = true;
     strlcpy(s_sessions[slot].token_hex, token_hex_out, sizeof(s_sessions[slot].token_hex));
-    s_sessions[slot].last_seen_us = esp_timer_get_time();
+    s_sessions[slot].last_seen_us = now;
+    s_sessions[slot].issued_us = now;
+}
+
+/* Caller must hold s_auth_lock. Installs a fresh nonce into nonce_hex_out and
+ * an available slot, evicting the oldest-issued slot if the table is full -
+ * same eviction policy as session_create_locked() above, applied to pending
+ * login challenges instead of sessions. Review finding F15
+ * (design/PROJECT_REVIEW_2026-09-10.md): before this, one global pending
+ * challenge meant a second client's GET .../challenge silently invalidated a
+ * first client's in-flight one, and a wrong/stale nonce submitted by anyone
+ * cleared whatever challenge happened to be pending - not necessarily the
+ * sender's own. A small table, each slot independently matched by its own
+ * nonce in auth_verify_login(), means one client's traffic - legitimate or
+ * not - can no longer affect another's. An expired-but-not-yet-reclaimed slot
+ * counts as free here, same as an unused one, so a burst of abandoned
+ * challenges from one client doesn't evict a different client's still-valid
+ * one ahead of its own TTL. */
+static void challenge_issue_locked(char *nonce_hex_out)
+{
+    uint8_t nonce_bytes[16];
+    esp_fill_random(nonce_bytes, sizeof(nonce_bytes));
+    bytes_to_hex(nonce_bytes, sizeof(nonce_bytes), nonce_hex_out);
+
+    int64_t now = esp_timer_get_time();
+    int slot = -1;
+    int64_t oldest_issued = INT64_MAX;
+    int oldest_idx = 0;
+    for (int i = 0; i < AUTH_CHALLENGE_MAX; i++) {
+        if (!s_pending_challenges[i].active || (now - s_pending_challenges[i].issued_us) >= AUTH_CHALLENGE_TTL_US) {
+            slot = i;
+            break;
+        }
+        if (s_pending_challenges[i].issued_us < oldest_issued) {
+            oldest_issued = s_pending_challenges[i].issued_us;
+            oldest_idx = i;
+        }
+    }
+    if (slot < 0) {
+        slot = oldest_idx;
+    }
+
+    strlcpy(s_pending_challenges[slot].nonce_hex, nonce_hex_out, sizeof(s_pending_challenges[slot].nonce_hex));
+    s_pending_challenges[slot].active = true;
+    s_pending_challenges[slot].issued_us = now;
 }
 
 esp_err_t auth_init(gw_config_t *cfg)
@@ -264,14 +338,8 @@ bool auth_begin_login_challenge(char *nonce_hex_out, char *salt_hex_out, uint32_
         return false;
     }
 
-    uint8_t nonce_bytes[16];
-    esp_fill_random(nonce_bytes, sizeof(nonce_bytes));
-    bytes_to_hex(nonce_bytes, sizeof(nonce_bytes), nonce_hex_out);
-
     xSemaphoreTake(s_auth_lock, portMAX_DELAY);
-    strlcpy(s_pending_challenge.nonce_hex, nonce_hex_out, sizeof(s_pending_challenge.nonce_hex));
-    s_pending_challenge.active = true;
-    s_pending_challenge.issued_us = esp_timer_get_time();
+    challenge_issue_locked(nonce_hex_out);
     xSemaphoreGive(s_auth_lock);
 
     provisioning_config_lock();
@@ -296,13 +364,24 @@ auth_login_result_t auth_verify_login(const char *nonce_hex, const char *respons
         return AUTH_LOGIN_LOCKED_OUT;
     }
 
-    /* Single-use regardless of outcome, cleared right here - a captured
-     * (nonce, response) pair can never be replayed. */
-    bool challenge_ok = s_pending_challenge.active &&
-                         (now - s_pending_challenge.issued_us) < AUTH_CHALLENGE_TTL_US &&
-                         nonce_hex != NULL &&
-                         strcmp(s_pending_challenge.nonce_hex, nonce_hex) == 0;
-    s_pending_challenge.active = false;
+    /* Scan for the one slot matching this nonce, not a single shared one -
+     * see challenge_issue_locked()'s comment (review finding F15). Single-use
+     * regardless of outcome, cleared as soon as it's matched, before the HMAC
+     * below is even checked - a captured (nonce, response) pair can never be
+     * replayed, and this clears only the caller's own slot, never a
+     * different, still-pending challenge belonging to someone else. */
+    bool challenge_ok = false;
+    if (nonce_hex != NULL) {
+        for (int i = 0; i < AUTH_CHALLENGE_MAX; i++) {
+            if (s_pending_challenges[i].active &&
+                (now - s_pending_challenges[i].issued_us) < AUTH_CHALLENGE_TTL_US &&
+                strcmp(s_pending_challenges[i].nonce_hex, nonce_hex) == 0) {
+                s_pending_challenges[i].active = false;
+                challenge_ok = true;
+                break;
+            }
+        }
+    }
 
     if (!challenge_ok) {
         xSemaphoreGive(s_auth_lock);
@@ -366,10 +445,16 @@ bool auth_check_session(const char *token_hex)
     bool ok = false;
     for (int i = 0; i < AUTH_SESSION_MAX; i++) {
         if (s_sessions[i].in_use && strcmp(s_sessions[i].token_hex, token_hex) == 0) {
-            if (now - s_sessions[i].last_seen_us > AUTH_SESSION_IDLE_US) {
-                s_sessions[i].in_use = false; /* idle timeout - drop it rather than extend it */
+            /* Two independent reasons a session can be too old to use -
+             * review finding F15: idle timeout resets on every touch and
+             * never expires a session kept continuously active on its own;
+             * the absolute cap below does not reset, so even a session
+             * touched every minute for hours is still cut off eventually. */
+            if (now - s_sessions[i].last_seen_us > AUTH_SESSION_IDLE_US ||
+                now - s_sessions[i].issued_us > AUTH_SESSION_ABSOLUTE_MAX_US) {
+                s_sessions[i].in_use = false; /* timed out - drop it rather than extend it */
             } else {
-                s_sessions[i].last_seen_us = now; /* sliding idle timeout */
+                s_sessions[i].last_seen_us = now; /* sliding idle timeout only - issued_us never moves */
                 ok = true;
             }
             break;
