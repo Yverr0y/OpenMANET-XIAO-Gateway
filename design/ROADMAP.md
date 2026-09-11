@@ -19,9 +19,13 @@ you're picking the project back up.**
   across four repeat runs after reflashing; F14's migration fix was verified by simulating a real
   version bump against a board with a real marker config, which the fix's first pass still lost - a
   second pass (gating `tls_identity.c`'s auto-persist) then proved to preserve it intact across the
-  identical round trip. A separate P0 regression blocking the relay role's native Wi-Fi uplink, found
-  while verifying F06, is still open - see the item directly under F06 - though a shorter USB cable
-  produced one clean, sustained run and a powered hub is the next planned test)
+  identical round trip. With Stage B/C closed out, a 3h39m relay+leaf stability soak (see "What the
+  Sep 11 stability soak proved" under item 8) found zero reboots, zero heap leaks, and 99.4% CoT
+  delivery with the last 650 packets at 0% loss - the review-tracker work didn't regress basic link
+  stability. A separate P0 regression blocking the relay role's native Wi-Fi uplink, found while
+  verifying F06, is still open - see the item directly under F06 - though it did not reproduce at
+  all during the soak, run on the shorter cable the earlier fix used; a powered hub is still the
+  next planned test)
 
 Keep this file current: tick the checklist when a step passes, move an item out of "not built yet"
 when it lands, and add to "settled decisions" rather than re-arguing one. Historical detail
@@ -1374,6 +1378,35 @@ running it, captured here so they aren't re-derived from scratch:
 Test method once those are settled: same `gwcfg-cot-test <count> <interval_ms>` flow as the Seventh
 finding above, run from the leaf (stays reachable via USB regardless of where the relay ends up),
 read loss off the relay's `cot downlink` rx counter.
+
+#### What the Sep 11 stability soak proved
+
+Run immediately after closing out Stage B and Stage C (F06/F07/F08/F11/F13, F02/F03/F15/F14's
+migration portion - see the "2026-09-10 review tracker" section above), as a real-world check that
+none of that work regressed basic link stability. Both bench nodes freshly configured end to end via
+console (not left over from earlier testing): relay with its real Wi-Fi uplink (home network) and a
+HaLow AP (`xiao-relay-1`, SAE, op_class 2/chan 26), leaf associated to it with a static 172.16.60.2
+address. A background Python monitor polled `gwcfg-status` on both nodes over USB serial every 2
+minutes and ran a 50-packet `gwcfg-cot-test` (leaf → relay) every 10 minutes, watching for the
+firmware-version string changing (a reboot) or internal free heap dropping >10KB between samples (a
+leak), logging everything with timestamps.
+
+**Result, 3h39m (09:09-12:49), far past the 2h originally asked for**: zero reboots on either node
+(firmware version string never changed once), zero heap-leak flags. Internal free heap drifted by
+under 500 bytes total on each node over the whole run - relay 98,079 → 97,599 bytes, leaf 118,367 →
+117,939 bytes - noise, not a trend. The relay's Wi-Fi uplink RSSI wandered normally (-66 to -75 dBm)
+with no degradation over time; the HaLow AP kept the leaf continuously associated (`halow ap stas: 1`)
+for the entire run. 21 CoT loss-test rounds (1050 packets total): 6 lost across the first 8 rounds
+while the link was apparently still settling, then **13 consecutive rounds (650 packets) at 0% loss**
+through to the end - an overall 99.4% delivery rate with no indication of degrading further.
+
+Confirms the whole review-tracker pass (F06's radio_control priority fix, F07's scan-result
+delivery rewrite, F08's retry timer, F11's config revision check, F15's challenge table/session cap,
+F14's recovery-mode gating) didn't destabilize the two things that actually matter for a bench
+pair: the HaLow link staying associated, and CoT traffic actually getting through it. The one
+still-open item from this session, the relay's native Wi-Fi uplink crash tied to power delivery (see
+the item directly under F06), did not reproduce at all during this run - consistent with the
+power-delivery theory, run on the shorter cable the earlier fix used, not yet on a powered hub.
 
 ### 9. Persistent log storage and expanded config — scoping notes (2026-08-30)
 
