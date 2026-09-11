@@ -20,6 +20,7 @@ idf_component_register(
         "heap_guard.c"
         "tls_identity.c"
         "radio_control.c"
+        "net_validate.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_wifi

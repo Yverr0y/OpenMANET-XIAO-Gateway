@@ -17,6 +17,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "lwip/inet.h"
+#include "net_validate.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "task_stats.h"
@@ -355,96 +356,11 @@ esp_err_t provisioning_save(const gw_config_t *cfg)
     return err;
 }
 
-/* Validates one IPv4 host+netmask(+gateway) triple as actually usable, not
- * merely parseable - inet_aton() succeeding says nothing about a
- * non-contiguous mask, an IP that's really the network/broadcast address of
- * its own subnet, or a gateway that isn't reachable on it. `what` names the
- * field group in rejection messages (e.g. "local Wi-Fi"). `gateway_str` may
- * be NULL for a subnet with no gateway concept (the HaLow AP's own downlink
- * address - leaves point directly at it). On success, *ip_h_out and
- * *mask_h_out (host byte order) let the caller check two subnets against
- * each other - see subnets_overlap() below. Review finding F10,
- * design/PROJECT_REVIEW_2026-09-10.md. */
-static esp_err_t validate_host_subnet(const char *what, const char *ip_str, const char *netmask_str,
-                                       const char *gateway_str, uint32_t *ip_h_out, uint32_t *mask_h_out,
-                                       char *errbuf, size_t errbuf_len)
-{
-#define GW_SUBNET_REJECT(...)                                \
-    do {                                                     \
-        if (errbuf != NULL && errbuf_len > 0) {               \
-            snprintf(errbuf, errbuf_len, __VA_ARGS__);        \
-        }                                                     \
-        return ESP_ERR_INVALID_ARG;                           \
-    } while (0)
-
-    struct in_addr ip, mask;
-    if (inet_aton(ip_str, &ip) == 0) {
-        GW_SUBNET_REJECT("%s IP '%s' is not a valid address", what, ip_str);
-    }
-    if (inet_aton(netmask_str, &mask) == 0) {
-        GW_SUBNET_REJECT("%s netmask '%s' is not a valid address", what, netmask_str);
-    }
-
-    uint32_t mask_h = ntohl(mask.s_addr);
-    if (mask_h == 0) {
-        GW_SUBNET_REJECT("%s netmask '%s' must not be all-zero", what, netmask_str);
-    }
-    /* A valid netmask is some number of leading 1 bits followed by trailing 0
-     * bits. Inverted, that's trailing 1 bits with nothing above them - which
-     * is exactly the values of the form 2^n - 1 (including 0, /32's case).
-     * `inv & (inv + 1)` is zero only for such values: incrementing a run of
-     * trailing 1s carries all the way through it, so the AND has nothing left
-     * in common; any 1 bit sitting above a 0 (the non-contiguous case) survives
-     * the AND untouched. */
-    uint32_t inverted_mask = ~mask_h;
-    if ((inverted_mask & (inverted_mask + 1)) != 0) {
-        GW_SUBNET_REJECT("%s netmask '%s' is not contiguous", what, netmask_str);
-    }
-
-    uint32_t ip_h = ntohl(ip.s_addr);
-    uint32_t host_mask = ~mask_h;
-    uint32_t host_bits = ip_h & host_mask;
-    if (host_bits == 0) {
-        GW_SUBNET_REJECT("%s IP '%s' is the network address of its own subnet, not a usable host",
-                          what, ip_str);
-    }
-    if (host_bits == host_mask) {
-        GW_SUBNET_REJECT("%s IP '%s' is the broadcast address of its own subnet, not a usable host",
-                          what, ip_str);
-    }
-
-    if (gateway_str != NULL) {
-        struct in_addr gw;
-        if (inet_aton(gateway_str, &gw) == 0 || gw.s_addr == 0) {
-            GW_SUBNET_REJECT("%s gateway '%s' must be a valid, non-zero address", what, gateway_str);
-        }
-        uint32_t gw_h = ntohl(gw.s_addr);
-        if ((gw_h & mask_h) != (ip_h & mask_h)) {
-            GW_SUBNET_REJECT("%s gateway '%s' is not in the same subnet as %s", what, gateway_str, ip_str);
-        }
-    }
-
-    if (ip_h_out != NULL) {
-        *ip_h_out = ip_h;
-    }
-    if (mask_h_out != NULL) {
-        *mask_h_out = mask_h;
-    }
-    return ESP_OK;
-
-#undef GW_SUBNET_REJECT
-}
-
-/* True if the two (network, mask) pairs describe overlapping address ranges -
- * either network address falling inside the other's range, checked both ways
- * since neither mask is assumed to be the more specific one. Both inputs are
- * assumed already-validated (contiguous, non-zero) subnets. */
-static bool subnets_overlap(uint32_t ip_a_h, uint32_t mask_a_h, uint32_t ip_b_h, uint32_t mask_b_h)
-{
-    uint32_t net_a = ip_a_h & mask_a_h;
-    uint32_t net_b = ip_b_h & mask_b_h;
-    return ((net_a & mask_b_h) == net_b) || ((net_b & mask_a_h) == net_a);
-}
+/* validate_host_subnet()/subnets_overlap() moved to net_validate.c (review
+ * finding F16, design/PROJECT_REVIEW_2026-09-10.md's regression-suite ask) -
+ * same logic, unchanged, just relocated so it can be compiled and tested on
+ * a host instead of only ever running for the first time on real hardware.
+ * See net_validate.h for the full reasoning. */
 
 /* Rejects configs that would brick the device's own management path or that
  * esp_wifi/lwIP would refuse at bring-up. Shared by the console, the web UI,
@@ -652,24 +568,8 @@ const char *provisioning_security_name(gw_security_mode_t sec)
     return names[sec];
 }
 
-/* HaLow (802.11ah) has no WPA2-PSK mode - only open/OWE/SAE, confirmed
- * against the real morsemicro/halow SDK's enum mmwlan_security_type. */
-bool provisioning_parse_security(const char *s, gw_security_mode_t *out)
-{
-    if (strcmp(s, "open") == 0) {
-        *out = GW_SECURITY_OPEN;
-        return true;
-    }
-    if (strcmp(s, "owe") == 0) {
-        *out = GW_SECURITY_OWE;
-        return true;
-    }
-    if (strcmp(s, "sae") == 0) {
-        *out = GW_SECURITY_SAE;
-        return true;
-    }
-    return false;
-}
+/* provisioning_parse_security() also moved to net_validate.c, same reasoning
+ * as validate_host_subnet()/subnets_overlap() above - see net_validate.h. */
 
 const char *provisioning_role_name(gw_node_role_t role)
 {

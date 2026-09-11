@@ -11,21 +11,17 @@ you're picking the project back up.**
 - Companion docs: [`HARDWARE.md`](HARDWARE.md) (what to buy, how to build one, how to bring it up),
   [`PI_SIDE.md`](PI_SIDE.md) (the other end of the link)
 - Architecture diagram and repo layout: [`../README.md`](../README.md)
-- **Last updated:** 2026-09-11 (2026-09-10 review tracker: Stages A-D all complete - every finding
-  scoped down from the review's fuller design to its concrete, demonstrable bug, each verified on
-  real hardware or (F16) locally - see the "2026-09-10 review tracker" section below for the full
-  per-finding story, including two genuine hardware before/afters (F15, F14) and a real
-  regression-suite-style test of `patch_vendored_halow.py` (F16). Stage E: secure boot/flash
-  encryption (F14 production profile) is deliberately deferred, not built - see that item's own
-  entry for the cost/benefit reasoning. F16 also landed a CI-hardening follow-up
-  (`.github/workflows/build-firmware.yml`) - every third-party action pinned to a resolved commit
-  SHA rather than a mutable tag (one of them, `esp-idf-ci-action@v1`, turned out to be a branch,
-  not even a tag), the exact "untrusted ref interpolation" pattern the review names fixed, Pages
-  deploy permissions scoped to just the `deploy` job, and build provenance (IDF version, target,
-  the vendored HaLow component's hash) added to the published manifest - the shell logic dry-run
-  locally against real build artifacts and git history, not just YAML-parsed. The one still-open
-  P0 is a power-delivery regression tracked under F06, now seen on both bench boards - see that
-  item directly under F06; a powered hub is the next planned test)
+- **Last updated:** 2026-09-11 (2026-09-10 review tracker: Stages A-D complete, Stage E mostly so -
+  every finding scoped to its concrete, demonstrable bug and verified on real hardware or (F16)
+  locally, see the "2026-09-10 review tracker" section below for the full per-finding story. F16
+  grew into three follow-up passes this session: CI hardening (every GitHub Action SHA-pinned, an
+  injection-prone ref interpolation fixed, deploy permissions scoped, build provenance recorded),
+  time-based pinning (`.github/dependabot.yml`, 14-day cooldown), and a host-side automated
+  regression suite (`main/net_validate.c` + `main/host_tests/`, wired into a new
+  `host-tests.yml` CI workflow) - the review's "no maintained regression suite" finding. Stage E's
+  secure boot/flash encryption (F14 production profile) is a deliberate no, not built - see that
+  item's own entry for the cost/benefit reasoning. The one still-open P0 is a power-delivery
+  regression tracked under F06, seen on both bench boards - a powered hub is the next planned test)
 
 Keep this file current: tick the checklist when a step passes, move an item out of "not built yet"
 when it lands, and add to "settled decisions" rather than re-arguing one. Historical detail
@@ -851,10 +847,79 @@ errors, zero warnings, binary size unchanged at 41% free. Not yet verified on ha
 
       **Left open, deliberately**: `mmhalow_wifi_start()` itself still discards
       `mmwlan_ap_enable()`'s return status (a C/firmware change, a different kind of fix than this
-      script or its CI); the `espressif/idf` Docker image used for the actual build is pinned by
+      script or its CI); and the `espressif/idf` Docker image used for the actual build is pinned by
       version tag inside `esp-idf-ci-action`, not independently re-pinned to a digest here (would
       need to track that action's own image-selection logic to pin correctly rather than duplicate
-      its version string); and a maintained automated regression suite - see the new item below.
+      its version string).
+
+- [x] Automated regression suite, host-side (2026-09-11) — P2 — review finding F16's last major open
+      item: "no maintained automated firmware regression suite was found." **Scoped to pure logic
+      that can run on a development machine, not hardware-in-the-loop** - GitHub Actions has no
+      physical XIAO boards, so a CI-runnable suite has to be the pieces that don't need one. Two
+      pieces landed, both real - not scaffolding for a suite to fill in later:
+
+      1. **`main/net_validate.c`/`.h` (new)**: `validate_host_subnet()`, `subnets_overlap()` (both
+         previously `static` inside `provisioning.c`, review finding F10) and
+         `provisioning_parse_security()` (previously also in `provisioning.c`, already public via
+         `provisioning.h`) extracted verbatim - same logic, same comments, same citations - into
+         their own file with zero ESP-IDF dependency beyond `esp_err_t` itself, which is shimmed to
+         match `esp_err.h`'s real values (`#ifdef ESP_PLATFORM`, the macro ESP-IDF's own build
+         system already defines) when building off-target. `gw_config.h` already had no ESP-IDF
+         dependency of its own (checked, not assumed), so pulling in `gw_security_mode_t` didn't
+         reintroduce the thing this extraction exists to avoid. `provisioning.c` is otherwise
+         unchanged apart from the two now-relocated functions and one new `#include` - still the
+         file that owns `provisioning_validate()` and everything NVS/console/HTTP-shaped, which
+         stays genuinely untestable off-target without far heavier stubbing than this narrow
+         extraction needed.
+
+         `main/host_tests/test_net_validate.c`: 23 cases, plain C, no test-framework dependency
+         (a name, a boolean, and a running pass/fail count - matches this project's own
+         "don't add a dependency for something this small" instinct). Directly encodes the review
+         finding F10 bug as a named, permanent regression case ("saee" (typo) must never again
+         silently mean open) and this project's own real, shipped default subnets (SoftAP
+         172.16.50.0/24 vs HaLow AP 172.16.60.0/24, already recorded elsewhere in this file as
+         "correctly non-overlapping on real hardware") as a `subnets_overlap()` case - a false
+         positive there would make every relay unconfigurable at boot, not just fail a synthetic
+         edge case.
+
+      2. **`main/host_tests/test_patch_vendored_halow.py` (new)**: formalizes the exact manual
+         verification this session already did for F16's `patch_vendored_halow.py` fix (fully
+         patched/unpatched/partially-patched/unrecognized, four cases) into a real, saved,
+         `unittest`-based suite instead of a one-off that would have been lost. Uses temp-file
+         fixtures, not the real (gitignored, network-fetched) `managed_components/` tree, so it
+         doesn't depend on a full component-manager fetch just to run.
+
+      **Both suites proved they have real teeth, not just that they pass**: deliberately
+      reintroduced the exact F10 bug into a scratch copy of `net_validate.c` (unrecognized security
+      strings silently returning "open" again) and confirmed 4 of 23 cases correctly failed; then
+      reverted `patch_vendored_halow.py` to its pre-fix, single-whole-file-marker logic and confirmed
+      2 of 5 Python cases correctly failed (one of them via an *uncaught* `SystemExit` - the old code
+      couldn't even reach the "reject unknown state" path in that scenario, its own separate bug).
+      Both real files restored byte-for-byte afterward, confirmed via `diff`.
+
+      **Wired into a new, separate, fast CI workflow** (`.github/workflows/host-tests.yml`) rather
+      than an extra job in `build-firmware.yml` - this needs nothing but `gcc` and `python3`, no
+      ESP-IDF Docker image and no ~10 minute build, so it reports pass/fail independently rather than
+      being bundled behind the slow build's own status. `net_validate.c`'s host compile uses
+      `-Wall -Wextra -Werror`, matching this project's zero-warnings bar for the real firmware build
+      - it's compiled both ways (`ESP_PLATFORM` defined for the target, undefined here), so a warning
+      that only shows up in one of the two is exactly what this is for catching.
+
+      **Verified on real hardware too, not just the host suite** (the production code moved, so this
+      needed the same discipline as any other firmware change this session): a real `idf.py build`
+      (zero errors/warnings, binary size effectively unchanged) followed by flashing a physical node
+      and exercising both moved functions live over the console - `gwcfg-set-uplink ... saee`
+      correctly rejected ("security mode 'saee' not recognized"), and
+      `gwcfg-set-uplink-static-ip 172.16.60.0 ...` (a real network address, not a usable host)
+      correctly rejected, with a valid address accepted right after - matching the host suite's
+      results exactly, not just building cleanly.
+
+      **Left open, deliberately**: hardware-in-the-loop testing (would need self-hosted runners
+      wired to real boards - a different, larger kind of infrastructure than this) and extending
+      coverage to the other pure-logic candidates noted but not pulled in this pass - `dns_forward.c`'s
+      question-parsing/truncation logic (F04/F05) and `cot_relay.c`'s destination-group check (F09)
+      are the next-best candidates by the same "pure logic, real bug already found here" bar this
+      pass used to choose its first two.
 
 ### Stage F — measured optimization (needs A–D)
 - [ ] Cache radio/status into one supervisor snapshot (removes concurrent driver calls from HTTP/timer paths)
