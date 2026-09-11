@@ -43,6 +43,13 @@ static SemaphoreHandle_t s_send_lock = NULL;
 static cot_relay_counters_t s_counters_a; /* rx = arrived on a, tx = forwarded onto a */
 static cot_relay_counters_t s_counters_b;
 
+/* Datagrams dropped for arriving on the relay's port but not actually
+ * addressed to the configured CoT group - see relay_task()'s own comment
+ * (review finding F09). Not per-interface: which side it came in on doesn't
+ * change why it was rejected. Unlocked like the rx counters above - only
+ * relay_task() writes it, and a torn read on a stats display is harmless. */
+static uint32_t s_wrong_dest_drops = 0;
+
 static esp_err_t get_netif_addr(esp_netif_t *netif, struct in_addr *out)
 {
     esp_netif_ip_info_t ip_info;
@@ -168,24 +175,51 @@ static void relay_task(void *arg)
             continue;
         }
 
-        /* Which interface did this arrive on? Use ipi_ifindex, NOT ipi_addr:
-         * lwIP fills ipi_addr from the packet's *destination* address
-         * (sockets.c: inet_addr_from_ip4addr(&pkti->ipi_addr,
-         * ip_2_ip4(netbuf_destaddr(buf)))), which for this relay is always
-         * the multicast group and therefore never matches an interface's own
-         * unicast address. ipi_ifindex is the real arrival-interface signal
-         * (pkti->ipi_ifindex = buf->p->if_idx). */
+        /* Which interface did this arrive on? Use ipi_ifindex, NOT ipi_addr,
+         * for *that* question: lwIP fills ipi_addr from the packet's
+         * *destination* address (sockets.c: inet_addr_from_ip4addr(
+         * &pkti->ipi_addr, ip_2_ip4(netbuf_destaddr(buf)))), which for
+         * legitimate CoT traffic is always the multicast group and therefore
+         * never matches an interface's own unicast address - useless for
+         * telling interfaces apart. ipi_ifindex is the real arrival-interface
+         * signal (pkti->ipi_ifindex = buf->p->if_idx).
+         *
+         * ipi_addr is still read here, for a different question: review
+         * finding F09 (design/PROJECT_REVIEW_2026-09-10.md). The socket below
+         * binds INADDR_ANY:port, so it receives *any* UDP datagram addressed
+         * to this port on either interface - not just ones actually sent to
+         * the configured multicast group. Without checking ipi_addr, a plain
+         * unicast datagram sent straight at this node's own IP:port would be
+         * picked up here and faithfully re-transmitted as multicast to the
+         * whole other side - an open relay, not just a CoT forwarder. Because
+         * ipi_addr reflects the packet's *real* destination as parsed from
+         * its IP header, not a fixed value, it correctly reads back as
+         * whatever a stray unicast/broadcast/wrong-group packet was actually
+         * addressed to, which is exactly what makes it useful for validating
+         * against s_group_dest below. */
         int arrival_ifindex = -1;
+        struct in_addr dest_addr = { 0 };
         for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
             if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_PKTINFO) {
                 struct in_pktinfo *pktinfo = (struct in_pktinfo *)CMSG_DATA(cmsg);
                 arrival_ifindex = pktinfo->ipi_ifindex;
+                dest_addr = pktinfo->ipi_addr;
                 break;
             }
         }
 
         if (arrival_ifindex < 0) {
             ESP_LOGW(TAG, "datagram had no IP_PKTINFO, can't tell arrival interface - dropping");
+            continue;
+        }
+
+        if (dest_addr.s_addr != s_group_dest.sin_addr.s_addr) {
+            /* Not addressed to the configured CoT group - a stray unicast,
+             * broadcast, or different-multicast-group datagram that happens
+             * to share this port. Counted, not logged per-packet: a flood of
+             * these (deliberate or not) shouldn't itself become a logging
+             * flood - see cot_relay_get_wrong_dest_drops(). */
+            s_wrong_dest_drops++;
             continue;
         }
 
@@ -393,4 +427,9 @@ void cot_relay_get_counters(cot_relay_counters_t *out_uplink, cot_relay_counters
         *out_downlink = s_counters_b;
     }
     xSemaphoreGive(s_send_lock);
+}
+
+uint32_t cot_relay_get_wrong_dest_drops(void)
+{
+    return s_wrong_dest_drops;
 }

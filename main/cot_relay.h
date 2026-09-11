@@ -60,6 +60,16 @@ typedef struct {
  * may be NULL to skip it. */
 void cot_relay_get_counters(cot_relay_counters_t *out_uplink, cot_relay_counters_t *out_downlink);
 
+/* Count of datagrams dropped for arriving on the relay's port but not
+ * actually addressed to the configured CoT multicast group - review finding
+ * F09 (design/PROJECT_REVIEW_2026-09-10.md): the relay socket binds
+ * INADDR_ANY:port, so without this check a stray unicast/broadcast/
+ * wrong-group datagram sent straight at this node would be picked up and
+ * faithfully re-transmitted as multicast to the whole other side. A nonzero,
+ * growing value here means something is sending unexpected traffic at this
+ * port, worth investigating - zero is the expected steady state. */
+uint32_t cot_relay_get_wrong_dest_drops(void);
+
 #ifdef __cplusplus
 }
 #endif

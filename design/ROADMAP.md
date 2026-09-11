@@ -22,7 +22,10 @@ you're picking the project back up.**
   identical round trip. With Stage B/C closed out, a 3h39m relay+leaf stability soak (see "What the
   Sep 11 stability soak proved" under item 8) found zero reboots, zero heap leaks, and 99.4% CoT
   delivery with the last 650 packets at 0% loss - the review-tracker work didn't regress basic link
-  stability. A separate P0 regression blocking the relay role's native Wi-Fi uplink, found while
+  stability. Stage D then landed a scoped F09 fix (destination-group validation), closing a real
+  open-relay gap - a unicast datagram sent straight at either interface used to get amplified to
+  multicast on the other side; verified directly with a live probe packet against the same bench
+  pair. A separate P0 regression blocking the relay role's native Wi-Fi uplink, found while
   verifying F06, is still open - see the item directly under F06 - though it did not reproduce at
   all during the soak, run on the shorter cable the earlier fix used; a powered hub is still the
   next planned test)
@@ -626,7 +629,46 @@ errors, zero warnings, binary size unchanged at 41% free. Not yet verified on ha
       committing.
 
 ### Stage D — multi-node forwarding (needs A/B)
-- [ ] F09 — P1 — CoT relay has no destination-group check, dedup cache, or rate budget
+- [x] F09 (destination-group validation only - dedup cache, TTL policy, token-bucket rate budgets and
+      a redundant-relay envelope protocol are all still open, see below) — P1 — CoT relay has no
+      destination-group check, dedup cache, or rate budget. **Fixed the one gap in this finding that
+      is a genuine open-relay vulnerability, not a design tradeoff**: `cot_relay_start()`'s socket
+      binds `INADDR_ANY:port` (needed - it has to receive multicast arriving on either interface),
+      but `relay_task()` never checked the received datagram's actual *destination* address against
+      the configured CoT group - only which interface it arrived on and whether the source was this
+      node's own. That means a plain **unicast** datagram sent straight at either interface's own
+      IP:port would be picked up by this socket and faithfully re-transmitted as multicast to the
+      whole other side - the node acting as an open UDP relay for anyone who can reach either
+      interface, not just a CoT forwarder for the multicast group it's configured to carry.
+
+      Fixed by reading `ipi_addr` out of the same `IP_PKTINFO` ancillary data `relay_task()` already
+      parses for `ipi_ifindex` (no new syscall, no new cmsg loop), and dropping anything whose
+      destination doesn't match the configured group before it ever reaches `is_own_address()` or
+      `send_via()`. The existing comment on why `ipi_addr` can't identify the *arrival interface*
+      (it reflects the packet's destination, not which netif it came in on, so it's always the
+      multicast group for legitimate traffic) turns out to be exactly why it's the right signal for
+      *this* check - lwIP fills it from the datagram's real destination field, so a stray
+      unicast/broadcast/wrong-group packet correctly reads back as whatever it was actually addressed
+      to, not the group. Drops are counted, not logged per-packet (`cot_relay_get_wrong_dest_drops()`)
+      - a flood of these, deliberate or not, shouldn't become a logging flood itself, matching this
+      project's existing "aggregate repetitive errors" discipline (F17). Wired into both
+      `gwcfg-status` and `/api/status` alongside the existing CoT counters.
+
+      **Verified on real hardware with a direct, adversarial-shaped test, not just a clean build**:
+      with the relay+leaf bench pair up and freshly confirmed doing normal multicast CoT relay (50/50
+      delivered, `wrong_dest_drops: 0`), a single **unicast** UDP datagram was sent from this dev
+      machine straight at the relay's own home-network IP on the CoT port. Before this fix that
+      packet would have gone straight through `send_via()` onto the HaLow side. After it: the relay's
+      `cot uplink`/`cot downlink` counters did not move at all, `wrong_dest_drops` went 0 → 1 exactly
+      matching the one probe sent, and the leaf's own `cot downlink rx` confirmed zero packets
+      actually arrived as a result of it - the probe was identified and dropped, not amplified.
+
+      **Left open, deliberately** (the review's fuller "Implement" list): a dedup/fingerprint cache,
+      explicit multicast TTL policy, per-ingress token-bucket rate limiting, and a
+      hop-budget/origin-ID envelope for genuinely redundant multi-relay topologies. None of those
+      apply to this project's current single-relay-pair deployment the way the open-relay gap did -
+      they're real hardening for a future multi-node/redundant-gateway topology (Stage D's own
+      broader scope), not a demonstrated bug against what's actually running today.
 - [ ] F12 — P1 — heap-shedding's DHCP pause doesn't actually stop new associations/traffic
 
 ### Stage E — deployment hardening (needs B/C/D)

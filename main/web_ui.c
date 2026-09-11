@@ -498,6 +498,8 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(cot_down, "rx_bytes", (double)cot_downlink_counters.rx_bytes);
     cJSON_AddNumberToObject(cot_down, "tx_packets", cot_downlink_counters.tx_packets);
     cJSON_AddNumberToObject(cot_down, "tx_bytes", (double)cot_downlink_counters.tx_bytes);
+    /* Review finding F09 - see cot_relay_get_wrong_dest_drops()'s own comment. */
+    cJSON_AddNumberToObject(cot, "wrong_dest_drops", cot_relay_get_wrong_dest_drops());
 
     cJSON *uplink = cJSON_AddObjectToObject(root, "uplink");
     /* "connected" tracks the DHCP lease, not raw 802.11 association - the

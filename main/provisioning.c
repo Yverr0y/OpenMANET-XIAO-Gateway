@@ -1038,6 +1038,7 @@ static int cmd_gwcfg_status(int argc, char **argv)
                " B)\n",
                downlink_side.rx_packets, downlink_side.rx_bytes, downlink_side.tx_packets,
                downlink_side.tx_bytes);
+        printf("cot wrong-dest drops: %" PRIu32 "\n", cot_relay_get_wrong_dest_drops());
     }
     printf("country code  : %s (build-time, not settable here)\n", CONFIG_HALOW_COUNTRY_CODE);
     printf("free heap     : %u bytes\n", (unsigned)esp_get_free_heap_size());
