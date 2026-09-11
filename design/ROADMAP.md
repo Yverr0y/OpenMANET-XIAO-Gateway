@@ -11,10 +11,10 @@ you're picking the project back up.**
 - Companion docs: [`HARDWARE.md`](HARDWARE.md) (what to buy, how to build one, how to bring it up),
   [`PI_SIDE.md`](PI_SIDE.md) (the other end of the link)
 - Architecture diagram and repo layout: [`../README.md`](../README.md)
-- **Last updated:** 2026-09-11 (F06, F07 and a scoped-down F08 landed and hardware-verified - see
-  Stage B below. F06 fixed a real priority-inversion crash in `GW_ROLE_RELAY`'s HaLow AP bring-up;
-  F07 fixed a real use-after-free in HaLow scan result delivery; F08 fixed a real "never retries
-  again" gap in datapath bring-up, scoped down from the review's fuller network-supervisor redesign.
+- **Last updated:** 2026-09-11 (Stage B's F06, F07, F08 and F11 all landed, each scoped down from the
+  review's fuller design to the concrete, demonstrable bug within it - see Stage B below for what was
+  fixed vs. deliberately left open in each. F13 already landed earlier, so Stage B is now complete
+  except the fuller network-supervisor/config-store redesigns F08/F11 both intentionally deferred.
   A separate P0 regression blocking the relay role's native Wi-Fi uplink, found while verifying F06,
   is still open - see the item directly under F06 - though a shorter USB cable produced one clean,
   sustained run and a powered hub is the next planned test)
@@ -393,7 +393,50 @@ errors, zero warnings, binary size unchanged at 41% free. Not yet verified on ha
       redesign (100 outage/recovery cycles, controlled interleaving tests) are beyond what's
       practical to force on this bench setup - this fix targets the one gap that's a straightforward,
       demonstrable defect rather than an architectural gap needing that scale of testing.
-- [ ] F11 — P1 — saved config and active network state are conflated (no desired/active split)
+- [x] F11 (lost-update fix only, deliberately scoped down from the review's full desired/active
+      config-store redesign) — P1 — saved configuration and active network state are conflated.
+      **Confirmed by reading every writer, not just the one the review names**: `web_ui.c`'s
+      `config_post_handler()` is the *only* place in the firmware that reads a snapshot of the live
+      config, unlocks (deliberately - so a slow JSON parse doesn't hold `provisioning_config_lock()`
+      and stall the console/every other reader), then later re-locks and writes the *entire* snapshot
+      back. Every one of provisioning.c's 7 console setters (`gwcfg-set-node`, `-uplink`, `-softap`,
+      `-role`, `-uplink-mgmt`, `-uplink-static-ip`, `-wifi-uplink`, `-halow-ap`) and
+      `auth_commit_password()` in `auth.c` already do their own read-validate-write as one unbroken
+      lock hold - they cannot race each other or lose an update, and don't need this fix. So a
+      concurrent console edit landing in `config_post_handler()`'s unlocked window was the one real,
+      demonstrable gap: the HTTP write-back would silently clobber it with its own now-stale snapshot,
+      not just for the field the console changed but for *every* field neither side explicitly
+      touched - a true lost update, exactly as the review describes, not a hypothetical.
+
+      Fixed with an in-RAM revision counter rather than the review's fuller `desired_config`/
+      `active_config`/typed-patch design: a new `provisioning_config_commit()` (`main/provisioning.c`)
+      is now the *only* function allowed to write the live `gw_config_t`, and it bumps a
+      `provisioning_config_revision()` counter every time. All 8 existing write sites (7 console
+      setters + `auth_commit_password()`) were switched from a raw `*s_cfg = work`/`memcpy()` to call
+      it - mechanical, one line each, no behavior change for any of them. `config_post_handler()`
+      records the revision under the same lock as its initial snapshot, then checks it again under
+      the lock it re-takes before saving; a mismatch means something else committed while this
+      request was in flight, and the request is refused (500 with a clear message - `esp_http_server`
+      has no 409, same constraint noted elsewhere in this file) rather than guessing at a merge or
+      clobbering silently. The counter is deliberately not persisted and resets to 0 every boot - it
+      only has to mean "changed since I looked" within one boot's lifetime, not survive a reboot.
+
+      Verified with a real build (zero errors/warnings) and on real hardware: reflashed both physical
+      nodes, ran `gwcfg-set-node` on the relay through the refactored console path and confirmed the
+      new value stuck via `gwcfg-show` with the node otherwise unaffected (Wi-Fi uplink, HaLow AP, CoT
+      relay all still running) - proving the 8-site mechanical refactor didn't break the already-atomic
+      writers. **Not independently verified on hardware**: forcing the actual HTTP-vs-console race
+      itself would need a full PBKDF2/HMAC login client built just for this test (the config API sits
+      behind F03's session auth) - disproportionate effort for a change this mechanically simple to
+      reason about (a plain integer compare-and-reject, reusing a lock this file already trusted for
+      every other read/write here). Flagged rather than silently assumed, matching this file's own
+      "verify, don't guess" discipline.
+
+      **Left open, deliberately**: the review's fuller redesign - typed patches applied against the
+      *latest* desired config rather than rejected outright, separate credential-vs-network-config
+      write paths, and reporting active-vs-pending/`reboot_required` to the UI - none of that is
+      built. This fix stops the silent data-loss case; it does not add patch semantics or a UI-visible
+      pending/active distinction.
 - [x] F13 (explicit budget + margin) — P1 — **landed 2026-09-10, ahead of the rest of Stage B at the
       user's direction.** The socket budget is now written down and computed, not implicit:
       GW_ROLE_RELAY needs exactly 7 (HTTPS: `HTTPD_SSL_CONFIG_DEFAULT()`'s `max_open_sockets=4` + 3

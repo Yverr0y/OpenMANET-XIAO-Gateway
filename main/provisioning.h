@@ -20,6 +20,23 @@ esp_err_t provisioning_init(void);
 void provisioning_config_lock(void);
 void provisioning_config_unlock(void);
 
+/* Current live-config revision. Caller must already hold
+ * provisioning_config_lock() - this is meant to be read in the same lock
+ * scope as a snapshot of the config itself, so the two are consistent with
+ * each other. Review finding F11 (design/PROJECT_REVIEW_2026-09-10.md): see
+ * provisioning_config_commit()'s own comment for what this is for. Never
+ * persisted and resets to 0 on every boot - it only means anything relative
+ * to another read earlier in the same boot. */
+uint32_t provisioning_config_revision(void);
+
+/* Adopts new_cfg as the live config and bumps the revision counter above.
+ * Caller must already hold provisioning_config_lock(). This is the only
+ * function that should ever write through the pointer console commands got
+ * from provisioning_register_console_commands() or web_ui.c holds via
+ * app_main's s_cfg - going through it rather than a raw struct copy is what
+ * lets provisioning_config_revision() actually mean something. */
+void provisioning_config_commit(const gw_config_t *new_cfg);
+
 /* Rejects a config that esp_wifi/lwIP would refuse at bring-up, or that
  * would take down the SoftAP the device is managed over (e.g. a WPA2
  * passphrase outside 8-63 chars, an out-of-range channel, a non-multicast

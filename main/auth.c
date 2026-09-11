@@ -480,7 +480,7 @@ auth_set_password_result_t auth_commit_password(const char *stored_key_hex, cons
 
     esp_err_t err = provisioning_save(&work);
     if (err == ESP_OK) {
-        memcpy(s_cfg, &work, sizeof(*s_cfg));
+        provisioning_config_commit(&work);
     }
     provisioning_config_unlock();
 

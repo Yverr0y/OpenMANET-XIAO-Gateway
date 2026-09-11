@@ -724,10 +724,14 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     }
 
     /* Validate into a scratch copy first so a rejected request never
-     * partially mutates the live config. */
+     * partially mutates the live config. seen_revision is read in the same
+     * lock scope as the snapshot it's paired with - see its use below and
+     * provisioning_config_revision()'s own comment (review finding F11,
+     * design/PROJECT_REVIEW_2026-09-10.md). */
     provisioning_config_lock();
     gw_config_t work;
     memcpy(&work, s_cfg, sizeof(work));
+    uint32_t seen_revision = provisioning_config_revision();
     provisioning_config_unlock();
 
     bool too_long = false;
@@ -868,13 +872,35 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     /* Save and write-back under one lock hold so NVS and the live config can't
      * end up disagreeing if a console edit interleaves (the console already
      * holds this lock across its own NVS write in cmd_gwcfg_save, so blocking
-     * briefly on flash I/O here is precedented). A console edit made while the
-     * request was still being parsed is still last-writer-wins - inherent to
-     * two unauthenticated writers, acceptable until auth adds sessions. */
+     * briefly on flash I/O here is precedented).
+     *
+     * Review finding F11 (design/PROJECT_REVIEW_2026-09-10.md): `work` above
+     * was built from a snapshot read *before* the parsing/validation this
+     * request just did, with the lock released in between (deliberately - see
+     * that snapshot's own comment on why: holding it across a slow JSON parse
+     * would stall every other task waiting on the same config, including the
+     * console). If a console command (or another request) committed a change
+     * in that window, blindly writing `work` back here would silently
+     * overwrite it with this request's now-stale view - "last writer wins" on
+     * fields this request never even looked at, not just the ones it meant to
+     * change. provisioning_config_revision() is what actually detects that:
+     * every write anywhere in the firmware bumps it (see
+     * provisioning_config_commit()'s own comment), so a mismatch here means
+     * exactly one thing - something else committed while this request was in
+     * flight - and this request refuses rather than guesses at a merge. The
+     * operator (or the page, on a retry) sees current values and can resubmit
+     * cleanly instead of a change silently vanishing. */
     provisioning_config_lock();
+    if (provisioning_config_revision() != seen_revision) {
+        provisioning_config_unlock();
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                             "config was changed by another session while this request was being "
+                             "processed - reload and try again");
+        return ESP_FAIL;
+    }
     esp_err_t err = provisioning_save(&work);
     if (err == ESP_OK) {
-        memcpy(s_cfg, &work, sizeof(*s_cfg));
+        provisioning_config_commit(&work);
     }
     provisioning_config_unlock();
 

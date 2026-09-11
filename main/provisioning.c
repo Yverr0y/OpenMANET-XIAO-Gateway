@@ -42,6 +42,21 @@ static gw_config_t *s_cfg = NULL;
  * provisioning_init(), i.e. before any of those exist. */
 static SemaphoreHandle_t s_cfg_lock = NULL;
 
+/* Bumped by every provisioning_config_commit() below - never persisted,
+ * never compared across a reboot, purely an in-RAM "has anyone written since
+ * I last looked" signal for the one caller that needs it. Review finding F11
+ * (design/PROJECT_REVIEW_2026-09-10.md): every console setter here already
+ * does its own read-validate-write as one unbroken provisioning_config_lock()
+ * hold, so they can't race each other or lose an update. web_ui.c's
+ * config_post_handler is the one exception - it deliberately unlocks between
+ * reading the snapshot it edits and writing the result back, so as not to
+ * hold this lock across a slow JSON parse - and used to write that whole
+ * snapshot back unconditionally, silently discarding anything a console
+ * command (or another request) changed in between. This counter is what lets
+ * that one caller detect the gap and refuse instead of clobbering - see
+ * config_post_handler's own use of provisioning_config_revision(). */
+static uint32_t s_cfg_revision = 0;
+
 void provisioning_config_lock(void)
 {
     if (s_cfg_lock != NULL) {
@@ -54,6 +69,17 @@ void provisioning_config_unlock(void)
     if (s_cfg_lock != NULL) {
         xSemaphoreGive(s_cfg_lock);
     }
+}
+
+uint32_t provisioning_config_revision(void)
+{
+    return s_cfg_revision;
+}
+
+void provisioning_config_commit(const gw_config_t *new_cfg)
+{
+    *s_cfg = *new_cfg;
+    s_cfg_revision++;
 }
 
 void provisioning_get_defaults(gw_config_t *cfg)
@@ -632,7 +658,7 @@ static int cmd_gwcfg_set_node(int argc, char **argv)
         return 1;
     }
 
-    *s_cfg = work;
+    provisioning_config_commit(&work);
     provisioning_config_unlock();
     return 0;
 }
@@ -665,7 +691,7 @@ static int cmd_gwcfg_set_uplink(int argc, char **argv)
         return 1;
     }
 
-    *s_cfg = work;
+    provisioning_config_commit(&work);
     provisioning_config_unlock();
     printf("uplink config updated in RAM; run 'gwcfg-save' then reboot to apply\n");
     return 0;
@@ -695,7 +721,7 @@ static int cmd_gwcfg_set_softap(int argc, char **argv)
         return 1;
     }
 
-    *s_cfg = work;
+    provisioning_config_commit(&work);
     provisioning_config_unlock();
     printf("softap config updated in RAM; run 'gwcfg-save' then reboot to apply\n");
     return 0;
@@ -719,7 +745,7 @@ static int cmd_gwcfg_set_role(int argc, char **argv)
         return 1;
     }
 
-    *s_cfg = work;
+    provisioning_config_commit(&work);
     provisioning_config_unlock();
     printf("role set to '%s' in RAM; run 'gwcfg-save' then reboot to apply - it changes which "
            "radios/netifs come up entirely, not just a config value\n",
@@ -792,7 +818,7 @@ static int cmd_gwcfg_set_uplink_static_ip(int argc, char **argv)
         return 1;
     }
 
-    *s_cfg = work;
+    provisioning_config_commit(&work);
     provisioning_config_unlock();
     printf("uplink static-IP config updated in RAM; run 'gwcfg-save' then reboot to apply\n");
     return 0;
@@ -818,7 +844,7 @@ static int cmd_gwcfg_set_wifi_uplink(int argc, char **argv)
         return 1;
     }
 
-    *s_cfg = work;
+    provisioning_config_commit(&work);
     provisioning_config_unlock();
     printf("Wi-Fi uplink config updated in RAM; run 'gwcfg-save' then reboot to apply\n");
     return 0;
@@ -855,7 +881,7 @@ static int cmd_gwcfg_set_halow_ap(int argc, char **argv)
         return 1;
     }
 
-    *s_cfg = work;
+    provisioning_config_commit(&work);
     provisioning_config_unlock();
     printf("HaLow AP config updated in RAM; run 'gwcfg-save' then reboot to apply\n");
     return 0;
