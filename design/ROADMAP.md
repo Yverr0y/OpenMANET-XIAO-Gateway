@@ -740,7 +740,23 @@ errors, zero warnings, binary size unchanged at 41% free. Not yet verified on ha
       what ships today beyond the two fixed above.
 
 ### Stage E — deployment hardening (needs B/C/D)
-- [ ] F14 (production profile) — P1 — flash/NVS encryption, secure boot, core-dump handling as one lifecycle
+- [ ] F14 (production profile) — P1 — flash/NVS encryption, secure boot, core-dump handling as one
+      lifecycle. **Deliberately deferred, not forgotten (2026-09-11 decision)**: secure boot and
+      flash encryption on this chip mean burning eFuses - irreversible. Get key custody or the
+      signing pipeline wrong and a board is permanently bricked with no recovery, which is exactly
+      why the review's own "Implement" text for this finding warns "do not burn eFuses... merely
+      because this report recommends a field profile; key custody, replacement and recovery must
+      first be tested on designated hardware" - i.e. sacrificial boards this project doesn't have.
+      That's real engineering days plus irreversible hardware risk, to defend against an attacker
+      with *physical possession* of a device who wants to persist malicious firmware undetected -
+      not this project's actual deployment today (a bench-tested private mesh gateway the operator
+      controls, not hardware handed to untrusted parties). Physical possession already grants the
+      factory-reset button and a USB console; secure boot doesn't change that calculus much. This
+      session's actual work went where the real, demonstrated attack surface was instead - network-
+      facing findings (F02/F03/F06/F07/F08/F09/F11/F12/F15, F14's own migration portion) - which is
+      a better return on the same hours. Revisit if/when this project moves toward hardware given to
+      people who aren't the operator, at which point budget real time for the "test on designated
+      hardware" step the review insists on rather than rushing it.
 - [ ] F16 — P2 — vendor-patch verification is marker-only; build identity isn't recorded/reproducible
 
 ### Stage F — measured optimization (needs A–D)
