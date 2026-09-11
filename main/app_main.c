@@ -26,6 +26,7 @@
 #include "link_history.h"
 #include "log_buffer.h"
 #include "provisioning.h"
+#include "radio_control.h"
 #include "status_led.h"
 #include "task_stats.h"
 #include "tls_identity.h"
@@ -624,6 +625,25 @@ void app_main(void)
     err = tls_identity_init(&s_cfg);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "TLS identity init failed: %s", esp_err_to_name(err));
+    }
+
+    /* Before either role's uplink_halow_init()/downlink_halow_ap_init() -
+     * both route every non-TX radio call through radio_control_run() from
+     * their own init function onward, so the owner task must already exist
+     * by the time bring_up_client_role()/bring_up_relay_role() run below.
+     * Review finding F06, design/PROJECT_REVIEW_2026-09-10.md. */
+    err = radio_control_init();
+    if (err != ESP_OK) {
+        /* Logged at error level, not warning like the others above: every
+         * radio call in both roles goes through this from here on, so
+         * uplink_halow_init()/downlink_halow_ap_init() (called from
+         * bring_up_client_role()/bring_up_relay_role() below) will each
+         * fail their own first radio_control_run() call and report "radio
+         * not initialized" - a real but much less direct symptom of this
+         * actual cause. Not aborted here: the rest of bring-up (SoftAP,
+         * web UI, console) is still useful without HaLow. */
+        ESP_LOGE(TAG, "radio_control_init failed: %s - HaLow will not be available this boot",
+                 esp_err_to_name(err));
     }
 
     ESP_ERROR_CHECK(esp_netif_init());

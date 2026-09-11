@@ -46,6 +46,7 @@ static const struct {
     { "dns_forward",     GW_STACK_DNS_FORWARD },
     { "wifi_reconnect",  GW_STACK_WIFI_RECONNECT },
     { "halow_reconnect", GW_STACK_HALOW_RECONNECT },
+    { "radio_control",  GW_STACK_RADIO_CONTROL },
     { "factory_reset",   GW_STACK_FACTORY_RESET },
     { "httpd",           GW_STACK_WEB_UI },
     { "evtloop",         HALOW_EVTLOOP_STACK },

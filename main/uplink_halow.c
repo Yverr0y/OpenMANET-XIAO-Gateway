@@ -12,6 +12,7 @@
 
 #include "mmhalow.h"
 
+#include "radio_control.h"
 #include "task_stats.h"
 
 static const char *TAG = "uplink_halow";
@@ -65,6 +66,93 @@ static struct scan_ctx {
     uint32_t count;
     uint32_t generation;
 } s_scan;
+
+/* --- radio_control glue (review finding F06, design/PROJECT_REVIEW_2026-09-10.md) ---
+ *
+ * Every non-TX mmwlan_ and mmhalow_ call in this file now goes through
+ * radio_control_run() instead of calling the driver directly - see
+ * main/radio_control.h for why. Every ctx below is static, never a stack
+ * local, same reasoning s_scan above already documents; where a call needs
+ * input (mmhalow_set_config()'s config struct), that input is copied into
+ * the static ctx by value before submitting, not passed as a pointer to
+ * the caller's own stack - a pointer into a caller's frame is exactly what
+ * a timed-out request must never let the owner task dereference later.
+ *
+ * get_rssi is reachable from more than one task (the reconnect task, the
+ * console, and the web UI) and shares one static result struct across all
+ * of them, so it gets its own mutex (s_rssi_lock) around that struct, on
+ * top of radio_control's own single-owner guarantee for the driver call
+ * itself - the same division of responsibility s_scan_lock above already
+ * has: radio_control serializes the *call*, this file's own lock serializes
+ * *callers reusing the same result storage*. print_version_info is also
+ * multi-caller but has no result to share (it only logs), so it needs no
+ * such lock. connect/disconnect/init/set_config have exactly one caller
+ * each (the boot sequence or the reconnect task) and don't need one either. */
+
+static void mm_sta_state_cb(enum mmwlan_sta_state sta_state); /* defined below */
+
+typedef struct {
+    esp_err_t result;
+} radio_err_ctx_t;
+
+static radio_err_ctx_t s_init_ctx;
+static void do_mmhalow_init(void *arg)
+{
+    ((radio_err_ctx_t *)arg)->result = mmhalow_init(NULL);
+}
+
+static radio_err_ctx_t s_connect_ctx;
+static void do_mmhalow_connect(void *arg)
+{
+    ((radio_err_ctx_t *)arg)->result = mmhalow_connect(mm_sta_state_cb);
+}
+
+static radio_err_ctx_t s_disconnect_ctx;
+static void do_mmhalow_disconnect(void *arg)
+{
+    ((radio_err_ctx_t *)arg)->result = mmhalow_disconnect();
+}
+
+typedef struct {
+    wifi_interface_t iface;
+    mmhalow_wifi_config_t conf; /* by value - see this block's own top comment */
+    esp_err_t result;
+} radio_set_config_ctx_t;
+
+static radio_set_config_ctx_t s_set_config_ctx;
+static void do_mmhalow_set_config(void *arg)
+{
+    radio_set_config_ctx_t *c = (radio_set_config_ctx_t *)arg;
+    c->result = mmhalow_set_config(c->iface, &c->conf);
+}
+
+static SemaphoreHandle_t s_rssi_lock = NULL;
+typedef struct {
+    int32_t rssi;
+} radio_rssi_ctx_t;
+static radio_rssi_ctx_t s_rssi_ctx;
+static void do_mmwlan_get_rssi(void *arg)
+{
+    ((radio_rssi_ctx_t *)arg)->rssi = mmwlan_get_rssi();
+}
+
+static void do_mmhalow_print_version_info(void *arg)
+{
+    (void)arg;
+    mmhalow_print_version_info();
+}
+
+/* s_scan's own generation/cb/ctx fields above are already single-writer,
+ * guarded by s_scan_lock (see that struct's comment) - this is just the
+ * args struct mmhalow_scan() itself needs, moved off uplink_halow_scan()'s
+ * stack for the same reason as everything else in this block. */
+static struct mmhalow_scan_args s_scan_args;
+static esp_err_t s_scan_start_result;
+static void do_mmhalow_scan(void *arg)
+{
+    (void)arg;
+    s_scan_start_result = mmhalow_scan(&s_scan_args);
+}
 
 /* HaLow (802.11ah) has no WPA2-PSK - confirmed against mmwlan.h's
  * enum mmwlan_security_type (MMWLAN_OPEN / MMWLAN_OWE / MMWLAN_SAE only). */
@@ -244,7 +332,16 @@ static esp_err_t apply_static_ip(esp_netif_t *netif, const gw_uplink_config_t *c
 
 static esp_err_t halow_sta_bringup(const gw_uplink_config_t *cfg, esp_netif_t **out_netif)
 {
-    esp_err_t err = mmhalow_init(NULL);
+    /* radio_control isn't strictly needed yet at this exact point - nothing
+     * else touches the radio until uplink_halow_start() creates the
+     * reconnect task, well after this returns - but every non-TX call in
+     * this file goes through it uniformly (see this file's own "radio_control
+     * glue" comment) rather than carving out an exemption for "the ones that
+     * happen to run before anything else exists yet". */
+    esp_err_t err = radio_control_run(do_mmhalow_init, &s_init_ctx, RADIO_CONTROL_DEFAULT_TIMEOUT_MS);
+    if (err == ESP_OK) {
+        err = s_init_ctx.result;
+    }
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "mmhalow_init failed: %s", esp_err_to_name(err));
         return err;
@@ -288,7 +385,13 @@ static esp_err_t halow_sta_bringup(const gw_uplink_config_t *cfg, esp_netif_t **
         return ESP_OK;
     }
 
-    mmhalow_wifi_config_t conf = {
+    /* Built directly in the static radio_control ctx (see this file's
+     * "radio_control glue" comment) rather than a local later copied in -
+     * one less copy, and there's no reason for this particular struct to
+     * ever exist as a stack local at all. */
+    s_set_config_ctx.iface = WIFI_IF_STA;
+    mmhalow_wifi_config_t *conf = &s_set_config_ctx.conf;
+    *conf = (mmhalow_wifi_config_t){
         .sta = MMWLAN_STA_ARGS_INIT,
     };
 
@@ -297,27 +400,29 @@ static esp_err_t halow_sta_bringup(const gw_uplink_config_t *cfg, esp_netif_t **
      * from mmwlan.h) and a copy sized only by strlen() would overflow if
      * theirs is ever the smaller of the two. */
     size_t ssid_len = strlen(cfg->ssid);
-    if (ssid_len > sizeof(conf.sta.ssid)) {
+    if (ssid_len > sizeof(conf->sta.ssid)) {
         ESP_LOGE(TAG, "uplink SSID is %u bytes, max %u", (unsigned)ssid_len,
-                 (unsigned)sizeof(conf.sta.ssid));
+                 (unsigned)sizeof(conf->sta.ssid));
         return ESP_ERR_INVALID_ARG;
     }
-    memcpy(conf.sta.ssid, cfg->ssid, ssid_len);
-    conf.sta.ssid_len = ssid_len;
+    memcpy(conf->sta.ssid, cfg->ssid, ssid_len);
+    conf->sta.ssid_len = ssid_len;
 
-    conf.sta.security_type = halow_security_from_gw(cfg->security);
-    if (conf.sta.security_type == MMWLAN_SAE) {
+    conf->sta.security_type = halow_security_from_gw(cfg->security);
+    if (conf->sta.security_type == MMWLAN_SAE) {
         size_t psk_len = strlen(cfg->psk);
-        if (psk_len > sizeof(conf.sta.passphrase)) {
+        if (psk_len > sizeof(conf->sta.passphrase)) {
             ESP_LOGE(TAG, "uplink passphrase is %u bytes, max %u", (unsigned)psk_len,
-                     (unsigned)sizeof(conf.sta.passphrase));
+                     (unsigned)sizeof(conf->sta.passphrase));
             return ESP_ERR_INVALID_ARG;
         }
-        memcpy(conf.sta.passphrase, cfg->psk, psk_len);
-        conf.sta.passphrase_len = psk_len;
+        memcpy(conf->sta.passphrase, cfg->psk, psk_len);
+        conf->sta.passphrase_len = psk_len;
     }
 
-    return mmhalow_set_config(WIFI_IF_STA, &conf);
+    esp_err_t set_config_err =
+        radio_control_run(do_mmhalow_set_config, &s_set_config_ctx, RADIO_CONTROL_DEFAULT_TIMEOUT_MS);
+    return (set_config_err == ESP_OK) ? s_set_config_ctx.result : set_config_err;
 }
 
 static esp_err_t halow_sta_connect(TickType_t timeout_ticks)
@@ -342,7 +447,10 @@ static esp_err_t halow_sta_connect(TickType_t timeout_ticks)
         return ESP_OK;
     }
 
-    esp_err_t err = mmhalow_connect(mm_sta_state_cb);
+    esp_err_t err = radio_control_run(do_mmhalow_connect, &s_connect_ctx, RADIO_CONTROL_DEFAULT_TIMEOUT_MS);
+    if (err == ESP_OK) {
+        err = s_connect_ctx.result;
+    }
     if (err != ESP_OK) {
         return err;
     }
@@ -461,7 +569,11 @@ static void reconnect_task(void *arg)
                 ESP_LOGW(TAG, "no DHCP lease on this association, disconnecting and re-associating");
             }
             set_has_ip(false);
-            esp_err_t dis_err = mmhalow_disconnect();
+            esp_err_t dis_err =
+                radio_control_run(do_mmhalow_disconnect, &s_disconnect_ctx, RADIO_CONTROL_DEFAULT_TIMEOUT_MS);
+            if (dis_err == ESP_OK) {
+                dis_err = s_disconnect_ctx.result;
+            }
             if (dis_err != ESP_OK) {
                 ESP_LOGW(TAG, "mmhalow_disconnect failed: %s", esp_err_to_name(dis_err));
             }
@@ -490,6 +602,10 @@ esp_err_t uplink_halow_init(const gw_uplink_config_t *cfg)
         s_scan_done = xSemaphoreCreateBinary();
         if (s_scan_lock == NULL || s_scan_done == NULL) {
             ESP_LOGW(TAG, "couldn't create scan primitives - scanning will be unavailable");
+        }
+        s_rssi_lock = xSemaphoreCreateMutex();
+        if (s_rssi_lock == NULL) {
+            ESP_LOGW(TAG, "couldn't create RSSI lock - RSSI reads will be unavailable");
         }
         /* Logged unconditionally at bring-up: if this prints, host<->MM6108
          * SPI works, which rules out the single most likely first-flash
@@ -590,7 +706,19 @@ int32_t uplink_halow_get_rssi(void)
     if (!s_ready || !s_associated) {
         return INT32_MIN;
     }
-    return mmwlan_get_rssi();
+    /* Reachable from the reconnect task, the console and the web UI -
+     * s_rssi_lock serializes callers reusing the shared s_rssi_ctx; see this
+     * file's "radio_control glue" comment for why that's this wrapper's own
+     * job rather than radio_control's. Falls back to INT32_MIN (the same
+     * "unknown" value as the checks above) if the lock was never created -
+     * see uplink_halow_init(). */
+    if (s_rssi_lock == NULL || xSemaphoreTake(s_rssi_lock, pdMS_TO_TICKS(RADIO_CONTROL_DEFAULT_TIMEOUT_MS)) != pdTRUE) {
+        return INT32_MIN;
+    }
+    esp_err_t err = radio_control_run(do_mmwlan_get_rssi, &s_rssi_ctx, RADIO_CONTROL_DEFAULT_TIMEOUT_MS);
+    int32_t rssi = (err == ESP_OK) ? s_rssi_ctx.rssi : INT32_MIN;
+    xSemaphoreGive(s_rssi_lock);
+    return rssi;
 }
 
 void uplink_halow_log_radio_info(void)
@@ -600,8 +728,11 @@ void uplink_halow_log_radio_info(void)
         return;
     }
     /* The component's own printer: BCF API/build version, board description,
-     * firmware and morselib versions, all via ESP_LOGI. */
-    mmhalow_print_version_info();
+     * firmware and morselib versions, all via ESP_LOGI. No shared ctx to
+     * protect (the printer takes no arguments and returns nothing), so
+     * unlike get_rssi this needs no caller-side mutex on top of
+     * radio_control's own serialization of the call itself. */
+    radio_control_run(do_mmhalow_print_version_info, NULL, RADIO_CONTROL_DEFAULT_TIMEOUT_MS);
 }
 
 /* `arg` is the generation this callback was registered for, passed by value
@@ -670,13 +801,21 @@ esp_err_t uplink_halow_scan(uplink_scan_cb_t cb, void *ctx, uint32_t timeout_ms)
      * this one doesn't return instantly on a stale signal. */
     xSemaphoreTake(s_scan_done, 0);
 
-    struct mmhalow_scan_args args = {
+    /* s_scan_args is static (see this file's "radio_control glue" comment) -
+     * safe to build in place here rather than in a local, since s_scan_lock
+     * (held for the whole duration of this function, taken just above)
+     * already guarantees only one caller of uplink_halow_scan() builds and
+     * submits it at a time. */
+    s_scan_args = (struct mmhalow_scan_args){
         .rx_cb = scan_rx_cb,
         .complete_cb = scan_complete_cb,
         .cb_arg = (void *)(uintptr_t)generation,
     };
 
-    esp_err_t err = mmhalow_scan(&args);
+    esp_err_t err = radio_control_run(do_mmhalow_scan, NULL, RADIO_CONTROL_DEFAULT_TIMEOUT_MS);
+    if (err == ESP_OK) {
+        err = s_scan_start_result;
+    }
     if (err == ESP_OK) {
         if (xSemaphoreTake(s_scan_done, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
             /* Results received so far have already been delivered to cb; the

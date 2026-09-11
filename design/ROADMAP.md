@@ -11,9 +11,10 @@ you're picking the project back up.**
 - Companion docs: [`HARDWARE.md`](HARDWARE.md) (what to buy, how to build one, how to bring it up),
   [`PI_SIDE.md`](PI_SIDE.md) (the other end of the link)
 - Architecture diagram and repo layout: [`../README.md`](../README.md)
-- **Last updated:** 2026-09-10 (2026-09-10 review's Stage A landed in full; F02's HTTPS/per-device-
-  identity switch landed and confirmed booting/serving on real hardware - see "Settled decisions →
-  Authentication → TLS")
+- **Last updated:** 2026-09-11 (F06's radio_control task+queue landed and hardware-verified - fixed
+  a real priority-inversion crash in `GW_ROLE_RELAY`'s HaLow AP bring-up; see Stage B below. Found,
+  while verifying it, a separate P0 regression blocking the relay role's native Wi-Fi uplink -
+  see the new item directly under F06)
 
 Keep this file current: tick the checklist when a step passes, move an item out of "not built yet"
 when it lands, and add to "settled decisions" rather than re-arguing one. Historical detail
@@ -219,7 +220,76 @@ Verified by a real `idf.py build` after each change (per this file's own discipl
 errors, zero warnings, binary size unchanged at 41% free. Not yet verified on hardware.
 
 ### Stage B — ownership and recovery (needs A)
-- [ ] F06 — P0 — non-TX Morse radio API calls have no shared owner/serialization
+- [x] F06 — P0 — non-TX Morse radio API calls have no shared owner/serialization. Fixed with the
+      full task-queue design (user's explicit choice over a lighter mutex-only alternative): a new
+      `radio_control` module (`main/radio_control.c/.h`) owns a dedicated FreeRTOS task and a
+      depth-1 request queue; every non-TX `mmwlan_`/`mmhalow_` call in the firmware now goes through
+      `radio_control_run(fn, ctx, timeout_ms)` instead of being called directly from five previously
+      independent, unsynchronized contexts (boot task, `halow_reconnect`, the `esp_timer` service
+      task via `link_history.c`'s RSSI sampler, `console_repl`, and `httpd`). `ctx` must be
+      static/persistent, never a stack local - the same rule `uplink_halow.c`'s pre-existing
+      `s_scan_ctx` already established, reused here because a caller that times out and returns can
+      leave the owner task still holding a pointer into memory it no longer owns. Both
+      `uplink_halow.c` and `downlink_halow_ap.c` were rewired; `downlink_halow_ap_init()`'s
+      `s_channels_lock` mutex creation was moved out of a lazily-initialized, TOCTOU-racy first-call
+      site into `downlink_halow_ap_init()` itself (a genuine single-caller boot-time context) as
+      part of the same change.
+
+      **Real hardware bug found and fixed, not just a clean compile**: `radio_control_task` was
+      first created at this project's usual worker-task priority (5) - the same priority
+      `cot_relay`/`dns_forward`/`wifi_reconnect`/`halow_reconnect`/`datapath` already use. On real
+      hardware this crash-looped `GW_ROLE_RELAY`'s HaLow AP bring-up 100% reproducibly: a watchdog
+      panic (`TG1WDT_SYS_RST`, "interrupt watchdog") inside `mmint_morse_pagesets_work` (a
+      closed-source morselib symbol - confirmed via `xtensa-esp32s3-elf-addr2line` against the
+      actual built ELF showing `??:?` for that frame, unlike the surrounding frames which resolved
+      real file/line) on the vendor's own `drv` task, "Panic handler entered multiple times" on
+      every consecutive boot. Root cause, read from `mmwlan.h`'s own "Thread priorities" doc comment
+      (L16-28): the vendor's `spi_irq`/`drv`/`evtloop` threads all run at `MMOSAL_TASK_PRI_HIGH`,
+      which `mmosal_shim_freertos_esp32.c`'s `mmosal_task_create()` maps to FreeRTOS priority
+      `tskIDLE_PRIORITY(0) + 4 = 4` (`mmosal.h`'s `enum mmosal_task_priority`: IDLE=0, MIN=1, LOW=2,
+      NORM=3, HIGH=4) - and that same comment states outright "it is expected that application
+      threads run at a lower priority." `radio_control_task` at priority 5 was *above* all three
+      vendor threads instead of below them, backwards from the documented contract, and during the
+      relay's AP bring-up - which fires several `radio_control_run()` calls back-to-back with
+      essentially no gap - that let it preempt `drv` mid-pageset-work repeatedly. Fixed by dropping
+      `radio_control_task` to priority 3 (`MMOSAL_TASK_PRI_NORM`, the same level morselib's own lwIP
+      tcpip/ip threads use). Confirmed on real hardware across many consecutive reboots after the
+      fix: `downlink_halow_ap_init()` completes, the HaLow AP starts (`xiao-relay-1`, op_class 2,
+      chan 26), and HTTPS/web UI comes up - zero crashes, where before it was 100% reproducible.
+      `GW_ROLE_CLIENT`'s STA connect path never hit this (different, more interleaved call timing),
+      which is a difference in exposure, not evidence priority 5 was ever actually safe there either.
+
+      **A second, separate, pre-existing bug was uncovered as a direct result of this fix, not
+      caused by it**: with HaLow AP bring-up no longer crashing, `GW_ROLE_RELAY`'s boot sequence now
+      reaches `uplink_wifi_init()` (the native ESP32 2.4 GHz Wi-Fi uplink) for the first time in a
+      long while - and crashes there instead, 100% reproducibly, with the *same* `TG1WDT_SYS_RST`
+      reset reason, inside `wifi_lmac_init`/`wDev_Rxbuf_Init` (Espressif's own closed `libnet80211`/
+      `libpp` blob - also `??:?` under `addr2line`). Reordering `uplink_wifi_init()` before
+      `downlink_halow_ap_init()` as a diagnostic (not committed) moved the crash rather than fixing
+      it, and produced what looks like a genuine power-on reset loop instead (USB CDC fully
+      re-enumerating with a new device number every few seconds, `esp_reset_reason()` reporting
+      `power-on` rather than any watchdog) - consistent with the two radios' peak startup current
+      colliding, not a pure scheduling issue. The original call order was restored (this file's own
+      diagnostic reorder is not in the tree). Notably, `design/ROADMAP.md`'s own Aug 29 relay-run
+      notes below record this exact node successfully reaching "native Wi-Fi uplink associated and
+      got a DHCP lease" on that date - so this is a **regression introduced since Aug 29**, not a
+      bug that's always been there, most likely from this session's own HTTPS switch (F02: the
+      `httpd` task's stack grew 6144 → 7168 → 10240 bytes, and `esp_https_server`/mbedtls's own
+      internal-RAM footprint) and/or the F13 socket-budget raise (`CONFIG_LWIP_MAX_SOCKETS` 10 → 14,
+      ~1.7 KB more permanently reserved) tightening the internal (non-PSRAM) heap `esp_wifi_init()`
+      needs for its own DMA-capable buffers enough to push a marginal vendor init path from a clean
+      failure into a watchdog hang. Not yet root-caused or fixed - open as its own item below Stage B
+      rather than folded into F06, since F06's own scope (owning/serializing the *HaLow* radio API)
+      is what's actually fixed and hardware-verified.
+- [ ] Native Wi-Fi uplink bring-up crashes `GW_ROLE_RELAY` (regression since Aug 29, found while
+      hardware-verifying F06) — P0 — `uplink_wifi_init()`'s `esp_wifi_init()`/`esp_wifi_start()`
+      call trips a `TG1WDT_SYS_RST` interrupt watchdog inside Espressif's own closed
+      `wifi_lmac_init`/`wDev_Rxbuf_Init`, 100% reproducibly, immediately after the HaLow AP has
+      already started successfully. See F06's entry above for the full investigation so far
+      (symbolized backtrace, the reorder experiment that ruled out simple call-order and pointed at
+      a possible internal-RAM/current budget issue instead, and the suspected connection to this
+      session's own F02/F13 changes). Blocks full `GW_ROLE_RELAY` hardware verification - the HaLow
+      AP downlink now works, but the Wi-Fi uplink to the Pi does not.
 - [ ] F07 — P1 — scan timeout doesn't synchronize against callback lifetime
 - [ ] F08 — P1 — datapath bring-up is one-shot; recovery after address/partial-failure/timing races is incomplete
 - [ ] F11 — P1 — saved config and active network state are conflated (no desired/active split)

@@ -23,6 +23,16 @@ extern "C" {
 #define GW_STACK_WIFI_RECONNECT  4096
 #define GW_STACK_HALOW_RECONNECT 4096
 #define GW_STACK_FACTORY_RESET   4096
+/* Runs every non-TX mmwlan_ and mmhalow_ driver call in the firmware
+ * (review finding F06, design/PROJECT_REVIEW_2026-09-10.md - see
+ * main/radio_control.c).
+ * Matched to this project's other worker tasks rather than trimmed, same
+ * "budget generously, not exactly" reasoning as the rest of this table -
+ * the calls it makes are individually small (config structs, a getter, a
+ * scan-start kickoff), but it's a new task with no real-hardware measurement
+ * yet; re-measure via gwcfg-tasks/GET /api/tasks once it's exercised and
+ * raise if headroom is thin. */
+#define GW_STACK_RADIO_CONTROL   4096
 /* select() over two sockets plus a bounded pending-query table walk -
  * lighter than cot_relay's own budget (no cJSON, no multi-KB scan buffer),
  * but matched to it rather than trimmed, same reasoning as every other

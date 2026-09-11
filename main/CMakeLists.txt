@@ -19,6 +19,7 @@ idf_component_register(
         "dns_forward.c"
         "heap_guard.c"
         "tls_identity.c"
+        "radio_control.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_wifi
