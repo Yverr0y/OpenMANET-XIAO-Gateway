@@ -16,6 +16,14 @@ static size_t s_count = 0; /* valid samples so far, saturates at LINK_HISTORY_SA
 static SemaphoreHandle_t s_lock = NULL;
 static esp_timer_handle_t s_timer = NULL;
 
+/* Raw per-source readings from the same sample the ring above collapses into
+ * one value - see link_history_get_latest_halow_rssi()/_wifi_rssi()'s own
+ * comment in link_history.h for why both are kept separately too. Guarded by
+ * s_lock, same as the ring - one short critical section in sample_timer_cb()
+ * updates all three together. */
+static int32_t s_latest_halow_rssi = INT32_MIN;
+static int8_t s_latest_wifi_rssi = INT8_MIN;
+
 /* Both getters are safe to call regardless of which role is active - see
  * web_ui.c's status_get_handler() comment on this same pattern: the getter
  * for whichever role's init() never ran just reports its own idle sentinel
@@ -40,6 +48,8 @@ static void sample_timer_cb(void *arg)
 {
     (void)arg;
     int16_t rssi = sample_uplink_rssi();
+    int32_t halow_rssi = uplink_halow_get_rssi();
+    int8_t wifi_rssi = uplink_wifi_get_rssi();
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
     s_ring[s_head] = rssi;
@@ -47,6 +57,8 @@ static void sample_timer_cb(void *arg)
     if (s_count < LINK_HISTORY_SAMPLES) {
         s_count++;
     }
+    s_latest_halow_rssi = halow_rssi;
+    s_latest_wifi_rssi = wifi_rssi;
     xSemaphoreGive(s_lock);
 }
 
@@ -102,4 +114,26 @@ size_t link_history_get_rssi(int16_t *out, size_t out_capacity)
     xSemaphoreGive(s_lock);
 
     return n;
+}
+
+int32_t link_history_get_latest_halow_rssi(void)
+{
+    if (s_lock == NULL) {
+        return INT32_MIN;
+    }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    int32_t rssi = s_latest_halow_rssi;
+    xSemaphoreGive(s_lock);
+    return rssi;
+}
+
+int8_t link_history_get_latest_wifi_rssi(void)
+{
+    if (s_lock == NULL) {
+        return INT8_MIN;
+    }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    int8_t rssi = s_latest_wifi_rssi;
+    xSemaphoreGive(s_lock);
+    return rssi;
 }

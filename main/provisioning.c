@@ -16,6 +16,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "link_history.h"
 #include "lwip/inet.h"
 #include "net_validate.h"
 #include "nvs.h"
@@ -892,7 +893,7 @@ static int cmd_gwcfg_status(int argc, char **argv)
     esp_netif_t *uplink_netif;
     if (role == GW_ROLE_RELAY) {
         printf("wifi uplink   : %s\n", uplink_wifi_link_state_name(uplink_wifi_get_link_state()));
-        int8_t rssi = uplink_wifi_get_rssi();
+        int8_t rssi = link_history_get_latest_wifi_rssi();
         if (rssi == INT8_MIN) {
             printf("wifi RSSI     : (not associated)\n");
         } else {
@@ -908,7 +909,7 @@ static int cmd_gwcfg_status(int argc, char **argv)
         uplink_link_state_t state = uplink_halow_get_link_state();
         printf("uplink state  : %s\n", uplink_halow_link_state_name(state));
 
-        int32_t rssi = uplink_halow_get_rssi();
+        int32_t rssi = link_history_get_latest_halow_rssi();
         if (rssi == INT32_MIN) {
             printf("uplink RSSI   : (not associated)\n");
         } else {

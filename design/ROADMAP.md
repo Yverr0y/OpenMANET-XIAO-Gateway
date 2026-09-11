@@ -18,10 +18,16 @@ you're picking the project back up.**
   injection-prone ref interpolation fixed, deploy permissions scoped, build provenance recorded),
   time-based pinning (`.github/dependabot.yml`, 14-day cooldown), and a host-side automated
   regression suite (`main/net_validate.c` + `main/host_tests/`, wired into a new
-  `host-tests.yml` CI workflow) - the review's "no maintained regression suite" finding. Stage E's
-  secure boot/flash encryption (F14 production profile) is a deliberate no, not built - see that
-  item's own entry for the cost/benefit reasoning. The one still-open P0 is a power-delivery
-  regression tracked under F06, seen on both bench boards - a powered hub is the next planned test)
+  `host-tests.yml` CI workflow) - the review's "no maintained regression suite" finding. A CI
+  self-inflicted parse failure from that pass (a literal empty `${{ }}` inside an explanatory
+  comment - GitHub's Actions parser evaluates `run:` block text including comments, before the
+  shell ever sees it) was caught and fixed the same day, `actionlint`-verified. Stage E's secure
+  boot/flash encryption (F14 production profile) is a deliberate no, not built - see that item's
+  own entry for the cost/benefit reasoning. Stage F's status-cache item is done (`link_history.c`
+  now caches both uplinks' RSSI from its existing periodic sample; `gwcfg-status`/`/api/status`
+  read the cache instead of calling the radio live on every request), hardware-verified. The one
+  still-open P0 is a power-delivery regression tracked under F06, seen on both bench boards - a
+  powered hub is the next planned test)
 
 Keep this file current: tick the checklist when a step passes, move an item out of "not built yet"
 when it lands, and add to "settled decisions" rather than re-arguing one. Historical detail
@@ -922,7 +928,20 @@ errors, zero warnings, binary size unchanged at 41% free. Not yet verified on ha
       pass used to choose its first two.
 
 ### Stage F — measured optimization (needs A–D)
-- [ ] Cache radio/status into one supervisor snapshot (removes concurrent driver calls from HTTP/timer paths)
+- [x] Cache radio/status into one supervisor snapshot (removes concurrent driver calls from HTTP/timer paths) -
+      **landed 2026-09-11**. `link_history.c` already ran a 30s periodic timer sampling uplink RSSI into the
+      history ring (`sample_uplink_rssi()`); it now also latches the two raw per-source readings
+      (`s_latest_halow_rssi`/`s_latest_wifi_rssi`) from that same sample into two new getters,
+      `link_history_get_latest_halow_rssi()`/`_wifi_rssi()` (`main/link_history.h`/`.c`). `gwcfg-status`
+      (`provisioning.c`) and `/api/status` (`web_ui.c`) - previously each calling `uplink_halow_get_rssi()`/
+      `uplink_wifi_get_rssi()` live, competing with each other and with `link_history.c`'s own timer for the
+      single-owner `radio_control` task on every request - now read the cached values instead, at the cost of
+      up to 30s staleness (the same tradeoff the history ring itself already makes; this is a status
+      *display*, not a control-loop input). Verified on real hardware: `idf.py build` clean (zero
+      errors/warnings), flashed to the relay node, `gwcfg-status` over the console showed the expected
+      first-sample staleness immediately after boot (`wifi RSSI: (not associated)` while `wifi uplink: up`),
+      then the correct live value (`-64 dBm`, later `-66 dBm`) once the first periodic sample landed 30s
+      later - confirming the cache populates and updates, not just compiles.
 - [ ] Make scans asynchronous and bounded (job-ID pattern instead of blocking the HTTP task)
 - [ ] Profile before touching the 40 MHz SPI clock or NAPT table size
 - [ ] Pick and document an explicit Wi-Fi power-save policy, measured

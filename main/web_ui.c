@@ -523,8 +523,12 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     cJSON_AddBoolToObject(uplink, "configured", link_state != UPLINK_LINK_UNCONFIGURED);
 
     /* Null rather than a sentinel number when unknown, so the page can render
-     * "-" instead of a misleading -2147483648. */
-    int32_t rssi = uplink_halow_get_rssi();
+     * "-" instead of a misleading -2147483648. Cached, not live - see
+     * link_history.h's link_history_get_latest_halow_rssi() comment: this
+     * endpoint always queries both roles' RSSI unconditionally (comment
+     * below), and a live call here would mean every page load contends with
+     * link_history.c's own timer for the single-owner radio_control task. */
+    int32_t rssi = link_history_get_latest_halow_rssi();
     if (rssi == INT32_MIN) {
         cJSON_AddNullToObject(uplink, "rssi");
     } else {
@@ -551,7 +555,7 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     uplink_wifi_link_state_t wifi_state = uplink_wifi_get_link_state();
     cJSON_AddStringToObject(wifi_uplink, "state", uplink_wifi_link_state_name(wifi_state));
     cJSON_AddBoolToObject(wifi_uplink, "connected", uplink_wifi_is_connected());
-    int8_t wifi_rssi = uplink_wifi_get_rssi();
+    int8_t wifi_rssi = link_history_get_latest_wifi_rssi();
     if (wifi_rssi == INT8_MIN) {
         cJSON_AddNullToObject(wifi_uplink, "rssi");
     } else {
