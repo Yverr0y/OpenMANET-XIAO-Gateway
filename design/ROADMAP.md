@@ -11,10 +11,13 @@ you're picking the project back up.**
 - Companion docs: [`HARDWARE.md`](HARDWARE.md) (what to buy, how to build one, how to bring it up),
   [`PI_SIDE.md`](PI_SIDE.md) (the other end of the link)
 - Architecture diagram and repo layout: [`../README.md`](../README.md)
-- **Last updated:** 2026-09-11 (F06 and F07 both landed and hardware-verified - see Stage B below.
-  F06 fixed a real priority-inversion crash in `GW_ROLE_RELAY`'s HaLow AP bring-up; F07 fixed a real
-  use-after-free in HaLow scan result delivery. A separate P0 regression blocking the relay role's
-  native Wi-Fi uplink, found while verifying F06, is still open - see the item directly under F06)
+- **Last updated:** 2026-09-11 (F06, F07 and a scoped-down F08 landed and hardware-verified - see
+  Stage B below. F06 fixed a real priority-inversion crash in `GW_ROLE_RELAY`'s HaLow AP bring-up;
+  F07 fixed a real use-after-free in HaLow scan result delivery; F08 fixed a real "never retries
+  again" gap in datapath bring-up, scoped down from the review's fuller network-supervisor redesign.
+  A separate P0 regression blocking the relay role's native Wi-Fi uplink, found while verifying F06,
+  is still open - see the item directly under F06 - though a shorter USB cable produced one clean,
+  sustained run and a powered hub is the next planned test)
 
 Keep this file current: tick the checklist when a step passes, move an item out of "not built yet"
 when it lands, and add to "settled decisions" rather than re-arguing one. Historical detail
@@ -356,7 +359,40 @@ errors, zero warnings, binary size unchanged at 41% free. Not yet verified on ha
       - no crash, no hang, no behavior change visible to either caller (`web_ui.c`'s cJSON path shares
       the exact same, now-fixed delivery mechanism in `uplink_halow.c`, so this exercises the part
       that actually changed).
-- [ ] F08 — P1 — datapath bring-up is one-shot; recovery after address/partial-failure/timing races is incomplete
+- [x] F08 (retry-on-late-downlink only, deliberately scoped down from the review's full
+      network-supervisor redesign) — P1 — datapath bring-up is one-shot; recovery after
+      address/partial-failure/timing races is incomplete. **Fixed the one gap in this list that is a
+      concrete, demonstrable bug rather than a design tradeoff already recorded elsewhere**:
+      `datapath_task()` used to only retry a failed `bring_up_datapath()` on the *next*
+      `on_uplink_state(true)` call. If the uplink was already connected and stayed connected - the
+      common case, since an already-associated uplink reconnecting isn't what unblocks a slow
+      downlink - and the downlink then took longer than `wait_for_downlink_up()`'s
+      `DOWNLINK_UP_TIMEOUT_MS` (5s) to come up, nothing would ever wake the task again: the node
+      would sit with both radios up but no NAT/CoT relay configured until a manual reboot. Not
+      hypothetical - this session's own hardware testing measured the relay's HaLow AP downlink netif
+      taking anywhere from ~2.5s to several seconds past boot to report up, run to run, comfortably
+      within range of racing an uplink that's already connected well before it.
+
+      Fixed by giving `datapath_task()` its own bounded retry timer
+      (`DATAPATH_RETRY_INTERVAL_MS = 3000`) in addition to the existing wake-on-reconnect: once
+      `s_datapath_up` is set the task still parks on `portMAX_DELAY` and self-deletes exactly as
+      before (that resource-reclaim behavior is unchanged), but until then it retries every 3s on its
+      own regardless of uplink transitions. Safe to retry blindly - `ip_forward_nat_init()`,
+      `cot_relay_start()` and `dns_forward_start()` are all idempotent, cheap, state-setting calls
+      that already treat "already running" as success (confirmed by reading `ip_forward_nat.c` before
+      relying on it, not assumed). Verified with a real build (zero errors/warnings) and a full
+      reboot of both physical nodes: role client and role relay both came up clean, HaLow AP + Wi-Fi
+      uplink + CoT relay all running, no behavior change on the normal (fast) bring-up path.
+
+      **What this does *not* cover, deliberately**: the review's fuller F08 scope - a real
+      `network_supervisor` with typed link/address/service state, jittered backoff per failure class,
+      and reacting to a *changed* IP on reconnect (not just a repeated "up") - is still open. The
+      changed-IP case specifically is not a silent gap: it's already recorded as a deliberate v1
+      limitation in `bring_up_datapath()`'s own comment and in "Settled decisions" below, not
+      something this pass tried to re-litigate. The review's own acceptance criteria for the full
+      redesign (100 outage/recovery cycles, controlled interleaving tests) are beyond what's
+      practical to force on this bench setup - this fix targets the one gap that's a straightforward,
+      demonstrable defect rather than an architectural gap needing that scale of testing.
 - [ ] F11 — P1 — saved config and active network state are conflated (no desired/active split)
 - [x] F13 (explicit budget + margin) — P1 — **landed 2026-09-10, ahead of the rest of Stage B at the
       user's direction.** The socket budget is now written down and computed, not implicit:

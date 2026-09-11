@@ -184,9 +184,9 @@ static SemaphoreHandle_t s_datapath_wake = NULL;
  * failed right behind it for the same underlying reason.
  *
  * Bounded so a downlink that never comes up (radio init failure, no SSID
- * configured) doesn't wedge this task forever - bring_up_datapath()'s
- * existing "didn't finish, will retry on the next uplink reconnect" fallback
- * still applies if this times out. */
+ * configured) doesn't wedge this task forever - datapath_task()'s own retry
+ * timer (DATAPATH_RETRY_INTERVAL_MS) picks this attempt back up on its own if
+ * this times out, it doesn't depend on another uplink reconnect. */
 static bool wait_for_downlink_up(esp_netif_t *downlink_netif)
 {
     for (int waited_ms = 0; waited_ms < DOWNLINK_UP_TIMEOUT_MS; waited_ms += DOWNLINK_UP_POLL_MS) {
@@ -212,8 +212,7 @@ static void bring_up_datapath(esp_netif_t *downlink_netif, esp_netif_t *uplink_n
      * clearly and immediately. No reason to sit through
      * DOWNLINK_UP_TIMEOUT_MS first just to reach the same outcome. */
     if (downlink_netif != NULL && !wait_for_downlink_up(downlink_netif)) {
-        ESP_LOGW(TAG, "downlink netif not up after %dms - datapath is incomplete, "
-                      "will retry on the next uplink reconnect",
+        ESP_LOGW(TAG, "downlink netif not up after %dms - datapath is incomplete, will retry",
                  DOWNLINK_UP_TIMEOUT_MS);
         return;
     }
@@ -254,7 +253,7 @@ static void bring_up_datapath(esp_netif_t *downlink_netif, esp_netif_t *uplink_n
     if (nat_err == ESP_OK && cot_err == ESP_OK) {
         s_datapath_up = true;
     } else {
-        ESP_LOGW(TAG, "datapath is incomplete - will retry on the next uplink reconnect");
+        ESP_LOGW(TAG, "datapath is incomplete - will retry");
     }
 }
 
@@ -295,11 +294,42 @@ static void bring_up_datapath(esp_netif_t *downlink_netif, esp_netif_t *uplink_n
  * Doing it this way also means a callback can no longer block the event loop:
  * bring_up_datapath() waits on esp_netif's lwIP IPC for every call it makes,
  * and stalling sys_evt stalls delivery of every other event in the system. */
+/* How often datapath_task() retries bring_up_datapath() on its own, without
+ * waiting for another uplink reconnect - review finding F08
+ * (design/PROJECT_REVIEW_2026-09-10.md): "a downlink becoming ready after
+ * the wait expires may never retry" was a real, not theoretical, gap. Before
+ * this, a failed attempt only retried on the *next* on_uplink_state(true)
+ * call - so if the uplink came up first and stayed up (the common case: an
+ * already-associated uplink reconnecting isn't what unblocks a slow
+ * downlink), and the downlink then took longer than
+ * wait_for_downlink_up()'s DOWNLINK_UP_TIMEOUT_MS to come up, nothing would
+ * ever wake this task again and the node would sit with a radio up but no
+ * NAT/CoT relay configured until a manual reboot. Not a hypothetical race:
+ * this session's own hardware testing measured the HaLow AP downlink netif
+ * taking anywhere from ~2.5s to several seconds past boot to report up,
+ * depending on run - comfortably within range of colliding with an uplink
+ * that's already connected well before it.
+ *
+ * 3s is short enough that a node stuck on a genuinely slow downlink recovers
+ * within a few attempts, and long enough that a hung retry loop isn't
+ * hammering esp_netif_napt_enable()/cot_relay_start() every tick - both are
+ * cheap, idempotent state-setting calls (ip_forward_nat_init()'s own
+ * comment; cot_relay_start()/dns_forward_start() already treat "already
+ * running" as success), so retrying them costs little, but there's no
+ * reason to retry faster than the downlink itself is likely to change
+ * state. */
+#define DATAPATH_RETRY_INTERVAL_MS 3000
+
 static void datapath_task(void *arg)
 {
     (void)arg;
     for (;;) {
-        xSemaphoreTake(s_datapath_wake, portMAX_DELAY);
+        /* Once up, park forever - the exact case the comment below explains.
+         * Until then, retry on our own timer as well as on a wake-up, so a
+         * downlink that comes up late is not depending on another uplink
+         * reconnect that may never happen. */
+        TickType_t wait = s_datapath_up ? portMAX_DELAY : pdMS_TO_TICKS(DATAPATH_RETRY_INTERVAL_MS);
+        xSemaphoreTake(s_datapath_wake, wait);
 
         /* Snapshot under the lock for the same reason the role bring-up
          * functions do it: the console and web UI are live by now and can be
@@ -329,10 +359,11 @@ static void datapath_task(void *arg)
          * device holding a stack sized for the heaviest thing it ever does.
          *
          * 4 KB is worth reclaiming on a part that also runs two Wi-Fi stacks,
-         * lwIP with NAT, and an HTTP server. The retry-on-failure path is
-         * untouched: if either half failed, s_datapath_up is still false and
-         * this task stays alive waiting for the next reconnect to try again -
-         * which is exactly the bug the flag was moved here to fix.
+         * lwIP with NAT, and an HTTP server. If either half failed, s_datapath_up
+         * is still false and this task stays alive, retrying on its own timer
+         * (DATAPATH_RETRY_INTERVAL_MS above) as well as on the next reconnect -
+         * see that constant's comment for why relying on reconnects alone
+         * (this loop's original design) was itself review finding F08.
          *
          * The handle is cleared first so nothing is left holding a pointer to
          * a TCB the idle task is about to free - on_uplink_state() no longer
