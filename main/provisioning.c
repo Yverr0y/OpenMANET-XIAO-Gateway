@@ -37,6 +37,12 @@ static const char *TAG = "provisioning";
  * directly; set by provisioning_register_console_commands(). */
 static gw_config_t *s_cfg = NULL;
 
+/* Set by provisioning_get_recovery_defaults() below, never cleared - a fresh
+ * boot starts this false again regardless, and nothing needs to turn it back
+ * off mid-boot. See provisioning_in_recovery_mode()'s own comment for what
+ * this guards (review finding F14's migration portion). */
+static bool s_recovery_mode = false;
+
 /* The live config is touched by three tasks - the console REPL, the httpd
  * task, and app_main at boot - so mutation is serialized. Created in
  * provisioning_init(), i.e. before any of those exist. */
@@ -180,6 +186,72 @@ void provisioning_get_defaults(gw_config_t *cfg)
      * CA SB-327, UK PSTI - see CLAUDE.md). */
 }
 
+/* Same networking defaults as provisioning_get_defaults(), but with
+ * onboarding forced permanently closed instead of the fresh-device default
+ * of open. Use this - not provisioning_get_defaults() - wherever
+ * provisioning_load() falls back to defaults because a *stored* config
+ * existed but this firmware can't use it (wrong size, magic/version
+ * mismatch, failed validation), as opposed to no config ever having been
+ * written at all.
+ *
+ * Review finding F14's migration portion (design/PROJECT_REVIEW_2026-09-10.md):
+ * before this, every one of those fallback paths called
+ * provisioning_get_defaults() directly, which leaves password_set == false
+ * *and* onboarding_open == true - indistinguishable from a genuinely fresh,
+ * never-owned device. A routine GW_CONFIG_VERSION bump (this project has
+ * done three - v7, v8, v9 - across the same session that found this) would
+ * therefore silently un-own a real device on its next update: the operator's
+ * password is gone, and anyone with SoftAP access can walk through the
+ * first-use claim flow as if it were fresh out of the box. Not hypothetical -
+ * every version bump already shipped this session would have done exactly
+ * that to a device with a real stored credential.
+ *
+ * Forcing onboarding closed here means that path is no longer available by
+ * accident: the device still boots, still serves SoftAP/console/management
+ * (it is not bricked), but nobody can claim it through the web UI. The only
+ * way back in is the existing physical factory-reset button
+ * (factory_reset.c's do_factory_reset(), which calls
+ * provisioning_get_defaults() - not this function - deliberately, on
+ * physical possession) - exactly the "closed recovery state requiring local
+ * owner action" the review's acceptance criteria ask for, reusing an
+ * already-built, already-verified mechanism rather than a new one. */
+void provisioning_get_recovery_defaults(gw_config_t *cfg)
+{
+    provisioning_get_defaults(cfg);
+    cfg->auth.onboarding_ever_started = true;
+    cfg->auth.onboarding_open = false;
+    cfg->auth.onboarding_boots_remaining = 0;
+    s_recovery_mode = true;
+}
+
+/* True for the rest of this boot once provisioning_get_recovery_defaults()
+ * has run. Exists for exactly one caller: tls_identity.c's boot-time
+ * identity generation, which - like this whole fix is about - would
+ * otherwise auto-persist the very recovery defaults this function just
+ * derived, with no operator involved at all. Found on real hardware, not
+ * predicted: verifying this fix by simulating a version bump against a real
+ * stored credential showed the *auth* side working correctly (onboarding
+ * stayed closed), but the original config was still gone for good on the
+ * very next boot - tls_identity_init()'s own "no identity yet, generate and
+ * save one" logic ran during the same recovery boot and persisted the whole
+ * live (recovery-defaulted) struct in the process, permanently overwriting
+ * the real blob still sitting in NVS at that point.
+ *
+ * Deliberately not a general "block every write" gate: the console already
+ * requires physical access, which is the same "local owner action" bar the
+ * review asks a recovery state to enforce, so every console command
+ * (gwcfg-save, gwcfg-reset, gwcfg-reset-auth, gwcfg-reset-tls-identity, ...)
+ * stays free to persist normally, deliberately, when an operator is actually
+ * sitting at it. web_ui.c's config writes are already blocked in recovery
+ * mode for an unrelated reason - auth_require_session() has no session to
+ * check against with no password ever set. Only an unattended, no-operator
+ * background task auto-persisting on this device's own initiative needs to
+ * check this. */
+bool provisioning_in_recovery_mode(void)
+{
+    return s_recovery_mode;
+}
+
 esp_err_t provisioning_init(void)
 {
     if (s_cfg_lock == NULL) {
@@ -211,9 +283,23 @@ esp_err_t provisioning_load(gw_config_t *cfg)
     err = nvs_get_blob(handle, GWCFG_NVS_KEY, cfg, &len);
     nvs_close(handle);
 
-    if (err != ESP_OK || len != sizeof(*cfg)) {
-        ESP_LOGW(TAG, "stored config missing/invalid (%s), using defaults", esp_err_to_name(err));
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        /* The namespace exists (nvs_open() above succeeded) but this key was
+         * never written under it - genuinely nothing to preserve, same as
+         * the nvs_open() failure case above. Open defaults are correct here. */
+        ESP_LOGW(TAG, "no stored config (%s), using defaults", esp_err_to_name(err));
         provisioning_get_defaults(cfg);
+        return ESP_OK;
+    }
+    if (err != ESP_OK || len != sizeof(*cfg)) {
+        /* Unlike the case above, a value *was* found under this key - it's
+         * just not usable (wrong size, or some other NVS-level error reading
+         * it). Something was stored here once, possibly by a real owner, so
+         * this does not get to look like a fresh device - see
+         * provisioning_get_recovery_defaults()'s own comment (review finding
+         * F14's migration portion). */
+        ESP_LOGW(TAG, "stored config missing/invalid (%s), using recovery defaults", esp_err_to_name(err));
+        provisioning_get_recovery_defaults(cfg);
         return ESP_OK;
     }
 
@@ -221,9 +307,9 @@ esp_err_t provisioning_load(gw_config_t *cfg)
      * without changing the struct's size. Check the stamp explicitly. */
     if (cfg->magic != GW_CONFIG_MAGIC || cfg->version != GW_CONFIG_VERSION) {
         ESP_LOGW(TAG, "stored config is magic=0x%08" PRIx32 " v%" PRIu32 ", expected 0x%08" PRIx32
-                      " v%" PRIu32 " - using defaults",
+                      " v%" PRIu32 " - using recovery defaults",
                  cfg->magic, cfg->version, (uint32_t)GW_CONFIG_MAGIC, (uint32_t)GW_CONFIG_VERSION);
-        provisioning_get_defaults(cfg);
+        provisioning_get_recovery_defaults(cfg);
         return ESP_OK;
     }
 
@@ -232,8 +318,8 @@ esp_err_t provisioning_load(gw_config_t *cfg)
      * esp_wifi fail at AP start and taking the management path down. */
     char reason[96];
     if (provisioning_validate(cfg, reason, sizeof(reason)) != ESP_OK) {
-        ESP_LOGW(TAG, "stored config failed validation (%s), using defaults", reason);
-        provisioning_get_defaults(cfg);
+        ESP_LOGW(TAG, "stored config failed validation (%s), using recovery defaults", reason);
+        provisioning_get_recovery_defaults(cfg);
     }
 
     return ESP_OK;

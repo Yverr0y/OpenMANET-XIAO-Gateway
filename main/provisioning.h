@@ -50,8 +50,31 @@ esp_err_t provisioning_validate(const gw_config_t *cfg, char *errbuf, size_t err
  * deliberately *no* uplink at all (empty SSID - see gw_uplink_is_configured()).
  * A factory-fresh node is therefore explicitly "not configured" rather than
  * quietly chasing a placeholder AP; the operator names the Pi's HaLow AP via
- * the web UI or `gwcfg-set-uplink`. */
+ * the web UI or `gwcfg-set-uplink`. Reopens onboarding, same as a genuinely
+ * new device - only call this for a device that either never had a stored
+ * config, or whose owner is deliberately, physically re-claiming it (see
+ * factory_reset.c). For provisioning_load()'s own "a config was stored but
+ * this firmware can't use it" fallback, use
+ * provisioning_get_recovery_defaults() below instead. */
 void provisioning_get_defaults(gw_config_t *cfg);
+
+/* Same as provisioning_get_defaults() above, except onboarding is forced
+ * permanently closed rather than left open - see this function's own
+ * definition in provisioning.c for the full reasoning (review finding F14's
+ * migration portion, design/PROJECT_REVIEW_2026-09-10.md). Use this wherever
+ * a *stored* config existed but couldn't be used, so a routine
+ * GW_CONFIG_VERSION bump or NVS corruption can't silently make an owned
+ * device claimable by anyone with SoftAP access. */
+void provisioning_get_recovery_defaults(gw_config_t *cfg);
+
+/* True for the rest of this boot once provisioning_get_recovery_defaults()
+ * ran. One caller: tls_identity.c's boot-time (non-operator-triggered)
+ * identity generation, which must not auto-persist during a recovery boot -
+ * see this function's own definition in provisioning.c for why (review
+ * finding F14's migration portion). Not a general "is it safe to save"
+ * check - console commands and web UI writes have their own, different
+ * reasons they're already safe here; this exists for exactly one call site. */
+bool provisioning_in_recovery_mode(void);
 
 /* Loads config from NVS into cfg, falling back to provisioning_get_defaults()
  * if nothing has been saved yet or the stored blob is invalid. Always

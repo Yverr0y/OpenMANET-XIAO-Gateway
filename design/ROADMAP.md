@@ -11,14 +11,17 @@ you're picking the project back up.**
 - Companion docs: [`HARDWARE.md`](HARDWARE.md) (what to buy, how to build one, how to bring it up),
   [`PI_SIDE.md`](PI_SIDE.md) (the other end of the link)
 - Architecture diagram and repo layout: [`../README.md`](../README.md)
-- **Last updated:** 2026-09-11 (Stage B complete - F06/F07/F08/F11/F13, each scoped down from the
-  review's fuller design to the concrete, demonstrable bug within it, see Stage B below for what was
-  fixed vs. deliberately left open in each. Stage C's F15 also landed, with a genuine hardware
-  before/after: the old single-slot challenge bug was accidentally reproduced live during testing,
-  then confirmed fixed across four repeat runs after reflashing. A separate P0 regression blocking
-  the relay role's native Wi-Fi uplink, found while verifying F06, is still open - see the item
-  directly under F06 - though a shorter USB cable produced one clean, sustained run and a powered
-  hub is the next planned test)
+- **Last updated:** 2026-09-11 (Stage B complete - F06/F07/F08/F11/F13; Stage C complete -
+  F02/F03/F15/F14's migration portion; each scoped down from the review's fuller design to the
+  concrete, demonstrable bug within it - see the Stage B/C entries below for what was fixed vs.
+  deliberately left open in each. Both F15 and F14 landed with genuine hardware before/afters: F15's
+  old single-slot challenge bug was accidentally reproduced live during testing, then confirmed fixed
+  across four repeat runs after reflashing; F14's migration fix was verified by simulating a real
+  version bump against a board with a real marker config, which the fix's first pass still lost - a
+  second pass (gating `tls_identity.c`'s auto-persist) then proved to preserve it intact across the
+  identical round trip. A separate P0 regression blocking the relay role's native Wi-Fi uplink, found
+  while verifying F06, is still open - see the item directly under F06 - though a shorter USB cable
+  produced one clean, sustained run and a powered hub is the next planned test)
 
 Keep this file current: tick the checklist when a step passes, move an item out of "not built yet"
 when it lands, and add to "settled decisions" rather than re-arguing one. Historical detail
@@ -559,8 +562,64 @@ errors, zero warnings, binary size unchanged at 41% free. Not yet verified on ha
       rate-limited. Judged proportionate for a single-admin device already gated by
       `reject_if_remote()` (only same-subnet clients can reach any of this) rather than built out
       further.
-- [ ] F14 (migration portion) — P1 — schema-bump/corrupt-config paths can silently reset ownership
-- [ ] F14 (migration portion) — P1 — schema-bump/corrupt-config paths can silently reset ownership
+- [x] F14 (migration portion only - dev/field provisioning profiles, secure boot, flash/NVS
+      encryption and core-dump redaction are Stage E's "production profile" item, explicitly not
+      this) — P1 — schema-bump/corrupt-config paths can silently reset ownership. **Confirmed as a
+      real, not hypothetical, bug against this project's own history**: `provisioning_load()`'s
+      fallback-to-defaults path ran on a `GW_CONFIG_MAGIC`/`GW_CONFIG_VERSION` mismatch, a
+      wrong-size/unreadable blob, or failed validation - and every one of those called
+      `provisioning_get_defaults()`, which leaves `password_set == false` *and* `onboarding_open ==
+      true`. That's indistinguishable from a genuinely fresh, never-owned device. This session alone
+      bumped `GW_CONFIG_VERSION` three times (v7→v8→v9, for F02 and F03) - every one of those, on a
+      real device with a real stored credential, would have silently un-owned it on the next boot,
+      reopening the unauthenticated first-use claim flow to anyone with SoftAP access.
+
+      Fixed in two parts, the second found only by testing the first on real hardware:
+
+      1. A new `provisioning_get_recovery_defaults()` (`main/provisioning.c`) - same networking
+         defaults as `provisioning_get_defaults()`, but forces onboarding permanently closed instead
+         of open. `provisioning_load()`'s three "a blob existed but is unusable" fallback branches
+         (wrong size, magic/version mismatch, failed validation) now use it instead of the open
+         version; only a genuinely-never-written key (`ESP_ERR_NVS_NOT_FOUND`) still gets the open,
+         fresh-device defaults. The device still boots and still serves SoftAP/console/management -
+         it is not bricked - but nobody can claim it through the web UI. The only way back in is the
+         existing physical factory-reset button (`factory_reset.c`, already built and hardware-proven
+         earlier this project's life), which calls the *open* `provisioning_get_defaults()`
+         deliberately, on physical possession - exactly the review's "closed recovery state requiring
+         local owner action," reusing an existing mechanism rather than building a new one.
+         `provisioning_init()`'s own NVS-erase-on-corruption (`NO_FREE_PAGES`/`NEW_VERSION_FOUND`)
+         was deliberately left alone - that's ESP-IDF's own standard, unavoidable recovery pattern
+         for whole-partition-level corruption (nothing partial is readable at that layer at all),
+         a fundamentally different and rarer scenario than a per-blob schema mismatch.
+
+      2. **Found while verifying part 1 on real hardware, not predicted**: closing onboarding wasn't
+         enough on its own. `tls_identity_init()`'s boot-time "no identity yet, generate and save one"
+         logic ran during the same recovery boot and persisted the *entire* live (recovery-defaulted)
+         struct in the process - permanently overwriting the real blob still sitting in NVS at that
+         point, before any operator ever touched anything. Simulating a real version bump against a
+         board with a real, just-set marker config (`gwcfg-set-node f14-test-marker` +
+         `gwcfg-set-role relay`, saved) reproduced this exactly: after the round trip back to the
+         matching version, the marker was gone, replaced by client-role factory defaults. Fixed by a
+         `provisioning_in_recovery_mode()` flag, set by `provisioning_get_recovery_defaults()`, that
+         gates *only* `tls_identity.c`'s automatic (non-operator, `force == false`) persist -
+         `tls_identity_regenerate()`'s explicit `gwcfg-reset-tls-identity` console path (`force ==
+         true`) stays exempt, since console access already requires physical presence, the same bar
+         the review asks recovery to enforce. During a gated boot the freshly generated identity is
+         still used in RAM for that boot's HTTPS server - the device isn't left without one - it just
+         isn't persisted over the original blob. Deliberately not a general "block every save" gate:
+         every console command and the web UI's own config write are already safe here for their own,
+         different reasons (physical access; `auth_require_session()` has no session to check with no
+         password ever set) - this exists for the one call site that genuinely runs unattended.
+
+      **Verified on real hardware with a genuine, reproducible before/after**: the exact same
+      simulated-version-bump procedure against the exact same board, before fix part 2 landed,
+      destroyed `f14-test-marker`/`role: relay`; after it landed, run again start to finish, the
+      marker and role survived the round trip completely intact. Onboarding-closure (part 1) was
+      separately confirmed via `gwcfg-show-setup-secret` reporting "onboarding is closed - use
+      gwcfg-reopen-onboarding to claim this device" during the simulated-mismatch boot, instead of
+      handing out a setup code as it would for a genuinely fresh device. `GW_CONFIG_VERSION` was
+      returned to its real value (9) after each test; `git diff` confirmed `gw_config.h` clean before
+      committing.
 
 ### Stage D — multi-node forwarding (needs A/B)
 - [ ] F09 — P1 — CoT relay has no destination-group check, dedup cache, or rate budget

@@ -235,9 +235,26 @@ static void identity_worker_task(void *arg)
 
     if (err == ESP_OK) {
         provisioning_config_lock();
-        err = provisioning_save(&work);
-        if (err == ESP_OK) {
+        if (!args->force && provisioning_in_recovery_mode()) {
+            /* Review finding F14's migration portion
+             * (design/PROJECT_REVIEW_2026-09-10.md): this is the automatic,
+             * no-operator-involved boot-time path (tls_identity_init(), not
+             * the console's gwcfg-reset-tls-identity, which passes force=true
+             * and is exempt - see provisioning_in_recovery_mode()'s own
+             * comment). Found on real hardware: without this check, this
+             * call would persist the whole live (recovery-defaulted) struct
+             * the moment it ran, permanently overwriting a real config this
+             * boot couldn't read but hadn't actually lost yet. Use the
+             * freshly generated identity for this boot only - RAM, not NVS -
+             * so the device still serves HTTPS, but the original NVS blob is
+             * left alone for a future firmware (or the operator) to still
+             * have a chance at. */
             memcpy(s_cfg, &work, sizeof(*s_cfg));
+        } else {
+            err = provisioning_save(&work);
+            if (err == ESP_OK) {
+                memcpy(s_cfg, &work, sizeof(*s_cfg));
+            }
         }
         provisioning_config_unlock();
     }
