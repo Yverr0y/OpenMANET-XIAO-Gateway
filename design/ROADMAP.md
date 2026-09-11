@@ -25,10 +25,13 @@ you're picking the project back up.**
   stability. Stage D then landed a scoped F09 fix (destination-group validation), closing a real
   open-relay gap - a unicast datagram sent straight at either interface used to get amplified to
   multicast on the other side; verified directly with a live probe packet against the same bench
-  pair. A separate P0 regression blocking the relay role's native Wi-Fi uplink, found while
-  verifying F06, is still open - see the item directly under F06 - though it did not reproduce at
-  all during the soak, run on the shorter cable the earlier fix used; a powered hub is still the
-  next planned test)
+  pair. Stage D's F12 then landed too (honest DHCP-pause logging + real hysteresis on both shed
+  decisions), verified with a live hardware transition capture. Stage D is now complete
+  (F09 + F12); only Stage E remains. The still-open P0 power-delivery regression under F06 gained a
+  second data point during F12's verification - the leaf board (previously stable through the whole
+  soak and F09 test) showed the identical crash signature while being reflashed, consistent with the
+  issue extending beyond one board/cable rather than a code regression - see the item directly under
+  F06; a powered hub is still the next planned test)
 
 Keep this file current: tick the checklist when a step passes, move an item out of "not built yet"
 when it lands, and add to "settled decisions" rather than re-arguing one. Historical detail
@@ -308,6 +311,18 @@ errors, zero warnings, binary size unchanged at 41% free. Not yet verified on ha
       it, so this is corroborating evidence for the power theory, not a confirmed root-cause fix. A
       powered USB hub is the planned next test, to get a real, deliberate before/after comparison
       rather than relying on cable-quality variance.
+
+      **Second node affected (2026-09-11, during F12 verification):** the leaf board - previously
+      stable through the entire 3h39m stability soak and the F09 adversarial test earlier the same
+      session - began showing the identical signature (rapid USB re-enumeration, stuck at "Morse
+      Micro HaLow NetIF: Setting Channel List US", `reset reason: power-on`, no firmware panic ever
+      reached) while being reflashed for an unrelated change (`heap_guard.c`/`.h`, pure
+      comparison-threshold logic, no new timing or syscalls). The leaf also brings up two radios
+      close together at boot - native Wi-Fi SoftAP, then HaLow STA - the same structural shape as the
+      relay's own crash, just the other role. Consistent with the power-delivery theory extending
+      beyond one specific board/cable rather than a code regression: nothing shipped in the F09/F12
+      changes touches radio bring-up timing. Left for the same powered-hub test already planned
+      above, not separately investigated.
 
       A second diagnostic reorder (native Wi-Fi before the HaLow AP, matching `bring_up_client_role()`'s
       already-working structure of "native radio first, HaLow second") was tried and also reverted
@@ -669,7 +684,60 @@ errors, zero warnings, binary size unchanged at 41% free. Not yet verified on ha
       apply to this project's current single-relay-pair deployment the way the open-relay gap did -
       they're real hardening for a future multi-node/redundant-gateway topology (Stage D's own
       broader scope), not a demonstrated bug against what's actually running today.
-- [ ] F12 — P1 — heap-shedding's DHCP pause doesn't actually stop new associations/traffic
+- [x] F12 (honest logging + hysteresis only - measured radio/client admission control, moving work off
+      the shared timer task, bounded service queues and explicit reservations are all still open,
+      see below) — P1 — heap-shedding's DHCP pause doesn't actually stop new associations/traffic.
+      **Fixed the two concrete, narrowly-scoped bugs the review confirmed, not the full admission-
+      control redesign it also suggests**: (1) the log line printed when the SoftAP's DHCP server
+      paused said "pausing new SoftAP associations" - factually wrong, confirmed by reading what
+      `esp_netif_dhcps_stop()` actually does. It stops the DHCP server, nothing else: 802.11
+      association at the radio is untouched, and an already-leased or static-IP client keeps working
+      exactly as before. All this ever did was refuse a *new* DHCP lease, which is still a real,
+      useful admission control - just not the "no new associations" guarantee the wording implied to
+      whoever read the log. (2) both `apply_node_shed()` (DHCP pause) and `sample_timer_cb()` (CoT
+      shed) compared free internal heap against one shared threshold for both engaging *and* clearing
+      the degraded state, so a node whose heap happened to sit right at that line would flap in and
+      out of it - "shed engaged"/"cleared" every 5s sample - which is itself the kind of instability
+      an admission-control mechanism should prevent, not cause.
+
+      Fixed (1) by rewording the log lines to say what actually happens ("pausing/resuming new DHCP
+      leases"). Fixed (2) with real hysteresis: each of the two shed decisions now has a separate
+      `_ENTER_BYTES` (lower) and `_EXIT_BYTES` (higher) threshold, and which one is compared against
+      depends on the *current* latched state - once engaged, heap has to climb back past the higher
+      exit line before clearing, not just tick back over the same line it dropped below. `_ENTER_BYTES`
+      values are unchanged from before (64KiB/32KiB); `_EXIT_BYTES` adds a deliberately-chosen gap
+      (80KiB/48KiB) - a starting choice, not yet independently measured against real fragmentation
+      behavior, same caveat the original numbers already carried.
+
+      **Verified on real hardware, not just reasoned about**: temporarily set both CoT-shed thresholds
+      to bracket the relay's actual observed free-heap reading (110KiB/120KiB, comfortably above the
+      real ~97-103KiB baseline this session measured repeatedly), so the shed state would engage
+      immediately and stay engaged under real, live heap noise rather than a simulated one. Captured
+      the exact expected transition on boot (`CoT relay shed engaged (free internal heap 103507
+      bytes, enter threshold 112640)`), then watched 7 further 5s samples (35s) produce *zero*
+      further "cleared"/"engaged" log lines despite whatever normal heap drift occurred in that
+      window - directly confirming the gap holds under real observed noise, not just in theory.
+      Thresholds reverted to their real values immediately after; both boards reflashed and confirmed
+      not spuriously shedding under healthy heap (~97-118KiB internal free, both well above either
+      enter threshold).
+
+      **New data point surfaced while reflashing for this verification, not caused by it**: the leaf
+      board began exhibiting the same crash-loop signature already tracked as an open P0 under F06
+      (rapid USB re-enumeration, stuck at HaLow radio init, `reset reason: power-on`, no firmware
+      panic reached) - previously only seen on the relay. The leaf also brings up two radios close
+      together at boot (native Wi-Fi SoftAP + HaLow STA uplink), so this is consistent with the same
+      power-delivery theory, not a new regression - `heap_guard.c`/`.h`'s changes here are pure
+      comparison-threshold logic with no new timing or syscalls, and F12's own verification above was
+      captured cleanly on the relay *before* this appeared on the leaf. Left for the same physical
+      remediation (powered hub) already planned under F06's tracker entry, not re-investigated here.
+
+      **Left open, deliberately** (the review's fuller "Implement" list): measured radio/client-level
+      admission control (the actual "stop new associations" guarantee the old log wording implied but
+      never delivered), monitoring largest free block alongside total free bytes, moving the
+      DHCP/radio calls off the shared `esp_timer` service task, bounded per-client service queues, and
+      explicit reservations for CoT/DNS/management traffic ahead of allocation pressure. All real
+      hardening for sustained load this project hasn't load-tested yet, not a demonstrated defect in
+      what ships today beyond the two fixed above.
 
 ### Stage E — deployment hardening (needs B/C/D)
 - [ ] F14 (production profile) — P1 — flash/NVS encryption, secure boot, core-dump handling as one lifecycle

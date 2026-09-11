@@ -22,16 +22,24 @@ static bool s_dhcp_paused = false;
 static bool s_shed_cot = false;
 
 /* Pauses/resumes the SoftAP's DHCP server as free *internal* heap crosses
- * GW_HEAP_NODE_SHED_BYTES - see that macro's doc comment in heap_guard.h for
- * why internal SRAM, not the PSRAM-inflated combined figure, is what this
- * checks. No-op on a GW_ROLE_RELAY node (s_softap_netif is NULL there). */
+ * GW_HEAP_NODE_SHED_ENTER_BYTES/_EXIT_BYTES - see those macros' doc comments
+ * in heap_guard.h for why internal SRAM, not the PSRAM-inflated combined
+ * figure, is what this checks, and why they're two thresholds rather than
+ * one. No-op on a GW_ROLE_RELAY node (s_softap_netif is NULL there). */
 static void apply_node_shed(uint32_t free_internal_bytes)
 {
     if (s_softap_netif == NULL) {
         return;
     }
 
-    bool should_pause = free_internal_bytes < GW_HEAP_NODE_SHED_BYTES;
+    /* Hysteresis, not a single shared line - review finding F12
+     * (design/PROJECT_REVIEW_2026-09-10.md): a node hovering right at one
+     * threshold would otherwise stop/start the DHCP server on every 5s
+     * sample. s_dhcp_paused already latches the current state, so only the
+     * threshold *compared against* needs to change based on which side of
+     * the gap the last decision left it on. */
+    bool should_pause = s_dhcp_paused ? free_internal_bytes < GW_HEAP_NODE_SHED_EXIT_BYTES
+                                       : free_internal_bytes < GW_HEAP_NODE_SHED_ENTER_BYTES;
     if (should_pause == s_dhcp_paused) {
         return;
     }
@@ -49,12 +57,16 @@ static void apply_node_shed(uint32_t free_internal_bytes)
     }
 
     s_dhcp_paused = should_pause;
+    /* "new leases", not "new associations" - review finding F12 confirmed the
+     * old wording overstated what this does. Stopping the DHCP server has no
+     * effect on 802.11 association at the radio, and nothing at all for an
+     * already-leased or static-IP client. */
     if (should_pause) {
-        ESP_LOGW(TAG, "free internal heap %u bytes < %u - pausing new SoftAP associations",
-                 (unsigned)free_internal_bytes, (unsigned)GW_HEAP_NODE_SHED_BYTES);
+        ESP_LOGW(TAG, "free internal heap %u bytes < %u - pausing new DHCP leases",
+                 (unsigned)free_internal_bytes, (unsigned)GW_HEAP_NODE_SHED_ENTER_BYTES);
     } else {
-        ESP_LOGI(TAG, "free internal heap %u bytes - resuming new SoftAP associations",
-                 (unsigned)free_internal_bytes);
+        ESP_LOGI(TAG, "free internal heap %u bytes >= %u - resuming new DHCP leases",
+                 (unsigned)free_internal_bytes, (unsigned)GW_HEAP_NODE_SHED_EXIT_BYTES);
     }
 }
 
@@ -62,15 +74,19 @@ static void sample_timer_cb(void *arg)
 {
     (void)arg;
     /* Internal SRAM, not esp_get_free_heap_size() - see
-     * GW_HEAP_COT_SHED_BYTES's doc comment in heap_guard.h for why the
+     * GW_HEAP_COT_SHED_ENTER_BYTES's doc comment in heap_guard.h for why the
      * PSRAM-inflated combined figure is the wrong thing to react to here. */
     uint32_t free_internal_bytes = esp_get_free_internal_heap_size();
 
-    bool should_shed = free_internal_bytes < GW_HEAP_COT_SHED_BYTES;
+    /* Hysteresis, not a single shared line - same reasoning and same review
+     * finding (F12) as apply_node_shed() below. */
+    bool should_shed = s_shed_cot ? free_internal_bytes < GW_HEAP_COT_SHED_EXIT_BYTES
+                                   : free_internal_bytes < GW_HEAP_COT_SHED_ENTER_BYTES;
     if (should_shed != s_shed_cot) {
-        ESP_LOGW(TAG, "CoT relay shed %s (free internal heap %u bytes, threshold %u)",
+        ESP_LOGW(TAG, "CoT relay shed %s (free internal heap %u bytes, %s threshold %u)",
                  should_shed ? "engaged" : "cleared", (unsigned)free_internal_bytes,
-                 (unsigned)GW_HEAP_COT_SHED_BYTES);
+                 should_shed ? "enter" : "exit",
+                 (unsigned)(should_shed ? GW_HEAP_COT_SHED_ENTER_BYTES : GW_HEAP_COT_SHED_EXIT_BYTES));
     }
     s_shed_cot = should_shed;
 

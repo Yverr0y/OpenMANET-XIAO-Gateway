@@ -35,27 +35,51 @@
  * is "free" to begin with, and that baseline has never been read off a
  * running node. Placeholder pending a real /api/status heap_free_internal
  * reading - see design/ROADMAP.md. */
-#define GW_HEAP_COT_SHED_BYTES  (64u * 1024u)
+#define GW_HEAP_COT_SHED_ENTER_BYTES (64u * 1024u)
 
-/* Below this much free internal SRAM - lower than GW_HEAP_COT_SHED_BYTES, so
- * this trips second, once shedding CoT alone hasn't been enough - the
- * SoftAP's DHCP server is paused so no *new* phone can associate and get an
- * address on an already-degraded node. Already-leased clients are untouched;
- * this only refuses new ones. Same "no real measurement yet" caveat as
- * above. */
-#define GW_HEAP_NODE_SHED_BYTES (32u * 1024u)
+/* Review finding F12 (design/PROJECT_REVIEW_2026-09-10.md): a single shared
+ * threshold for both engaging and clearing a shed state means a node
+ * hovering right at the line flaps in and out of it on every sample -
+ * "CoT relay shed engaged"/"cleared" every 5s is itself a symptom worth
+ * avoiding, not just noise. The gap between enter and exit is deliberately
+ * chosen headroom, not yet independently measured against real fragmentation
+ * behavior - same "no real-hardware measurement yet" caveat the enter values
+ * already carried. */
+#define GW_HEAP_COT_SHED_EXIT_BYTES  (80u * 1024u)
+
+/* Below this much free internal SRAM - lower than GW_HEAP_COT_SHED_ENTER_BYTES,
+ * so this trips second, once shedding CoT alone hasn't been enough - the
+ * SoftAP's DHCP server is paused so no *new* client gets a *lease* on an
+ * already-degraded node.
+ *
+ * Deliberately not described as pausing "new associations" (this file used
+ * to say that, and so did a log line in heap_guard.c) - review finding F12
+ * confirmed that's inaccurate: stopping the DHCP server does not stop 802.11
+ * association at the radio, and does nothing at all for an already-leased or
+ * static-IP client, who keeps working exactly as before. All this actually
+ * does is refuse to hand out a *new* DHCP lease while degraded - a real,
+ * useful admission control on its own, just not the "no new associations"
+ * radio-level guarantee the old wording implied. */
+#define GW_HEAP_NODE_SHED_ENTER_BYTES (32u * 1024u)
+
+/* Same hysteresis reasoning as GW_HEAP_COT_SHED_EXIT_BYTES above, applied to
+ * the DHCP-pause decision instead of the CoT-shed one. */
+#define GW_HEAP_NODE_SHED_EXIT_BYTES  (48u * 1024u)
 
 /* Starts periodic heap-headroom sampling. softap_netif is the netif
  * downlink_softap_init() created (downlink_softap_get_netif()) - its DHCP
- * server is what gets paused/resumed as free heap crosses
- * GW_HEAP_NODE_SHED_BYTES. Pass NULL on a GW_ROLE_RELAY node:
- * downlink_halow_ap.c's netif runs no DHCP server to pause (static IP only -
- * see that file's own header comment), so only the CoT-shed and telemetry
- * halves of this module are meaningful there. */
+ * server is what gets paused/resumed as free internal heap crosses
+ * GW_HEAP_NODE_SHED_ENTER_BYTES/_EXIT_BYTES. Pass NULL on a GW_ROLE_RELAY
+ * node: downlink_halow_ap.c's netif runs no DHCP server to pause (static IP
+ * only - see that file's own header comment), so only the CoT-shed and
+ * telemetry halves of this module are meaningful there. */
 esp_err_t heap_guard_init(esp_netif_t *softap_netif);
 
-/* True once combined free heap has dropped below GW_HEAP_COT_SHED_BYTES.
- * Checked by cot_relay.c's relay_task before forwarding each datagram. */
+/* True once free *internal* heap has dropped below GW_HEAP_COT_SHED_ENTER_BYTES
+ * and not yet recovered back above GW_HEAP_COT_SHED_EXIT_BYTES - not the
+ * combined PSRAM-inflated figure, same reasoning as those macros' own
+ * comments. Checked by cot_relay.c's relay_task before forwarding each
+ * datagram. */
 bool heap_guard_should_shed_cot(void);
 
 /* Current combined free heap, its low-watermark since boot

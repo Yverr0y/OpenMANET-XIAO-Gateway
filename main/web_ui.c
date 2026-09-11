@@ -583,7 +583,7 @@ static esp_err_t status_get_handler(httpd_req_t *req)
      * tight. */
     cJSON_AddNumberToObject(sys, "heap_free_internal", heap_free_internal);
     /* Whether the CoT relay is currently dropping datagrams under heap
-     * pressure rather than forwarding them - see GW_HEAP_COT_SHED_BYTES. */
+     * pressure rather than forwarding them - see GW_HEAP_COT_SHED_ENTER_BYTES. */
     cJSON_AddBoolToObject(sys, "cot_relay_shed_active", heap_guard_should_shed_cot());
     /* ESP32-S3 die temperature, not the HaLow module's - see chip_temp.h for
      * why the latter isn't readable at all. Null (rather than a fabricated
