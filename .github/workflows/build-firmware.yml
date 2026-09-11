@@ -139,15 +139,22 @@ jobs:
           # Check if this is a tag release. Read from the environment
           # (GITHUB_REF_NAME/GITHUB_REF_TYPE - GitHub sets both automatically
           # for every step: https://docs.github.com/en/actions/learn-github-actions/variables#default-environment-variables),
-          # not `${{ github.ref_name }}` template-interpolation - review
-          # finding F16 (design/PROJECT_REVIEW_2026-09-10.md), "avoid directly
-          # interpolating untrusted ref names into shell scripts". A ref name
-          # interpolated via `${{ }}` is substituted into this script's *text*
-          # before the shell ever runs it, so a branch/tag name containing
-          # shell metacharacters becomes part of the command line, not a
-          # quoted value - the classic GitHub Actions script-injection
-          # pattern. Reading it as an environment variable instead means the
-          # shell only ever sees it as data.
+          # not GitHub's own double-curly template expression syntax applied
+          # to the ref name context directly - review finding F16
+          # (design/PROJECT_REVIEW_2026-09-10.md), "avoid directly
+          # interpolating untrusted ref names into shell scripts". (Spelled
+          # out in words rather than the literal syntax right here on
+          # purpose - GitHub scans every run: block's text, comments
+          # included, for that exact template syntax and tries to evaluate
+          # whatever's inside it; writing the literal empty form as an
+          # example is what broke this workflow's own YAML parse the first
+          # time this comment was written, confirmed via actionlint.) A ref
+          # name substituted that way lands in this script's *text* before
+          # the shell ever runs it, so a branch/tag name containing shell
+          # metacharacters becomes part of the command line, not a quoted
+          # value - the classic GitHub Actions script-injection pattern.
+          # Reading it as an environment variable instead means the shell
+          # only ever sees it as data.
           REF_NAME="${GITHUB_REF_NAME}"
           REF_TYPE="${GITHUB_REF_TYPE}"
 
