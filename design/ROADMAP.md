@@ -13,14 +13,19 @@ you're picking the project back up.**
 - Architecture diagram and repo layout: [`../README.md`](../README.md)
 - **Last updated:** 2026-09-11 (2026-09-10 review tracker: Stages A-D all complete - every finding
   scoped down from the review's fuller design to its concrete, demonstrable bug, each verified on
-  real hardware or (F16) against the real vendored files locally - see the "2026-09-10 review
-  tracker" section below for the full per-finding story, including two genuine hardware
-  before/afters (F15, F14) and a real regression-suite-style test of `patch_vendored_halow.py`
-  (F16). Stage E's secure boot/flash encryption (F14 production profile) is deliberately deferred,
-  not built - see that item's own entry for the cost/benefit reasoning. F16's remaining CI/build-
-  provenance items are still open. The one still-open P0 is a power-delivery regression tracked
-  under F06, now seen on both bench boards - see that item directly under F06; a powered hub is the
-  next planned test)
+  real hardware or (F16) locally - see the "2026-09-10 review tracker" section below for the full
+  per-finding story, including two genuine hardware before/afters (F15, F14) and a real
+  regression-suite-style test of `patch_vendored_halow.py` (F16). Stage E: secure boot/flash
+  encryption (F14 production profile) is deliberately deferred, not built - see that item's own
+  entry for the cost/benefit reasoning. F16 also landed a CI-hardening follow-up
+  (`.github/workflows/build-firmware.yml`) - every third-party action pinned to a resolved commit
+  SHA rather than a mutable tag (one of them, `esp-idf-ci-action@v1`, turned out to be a branch,
+  not even a tag), the exact "untrusted ref interpolation" pattern the review names fixed, Pages
+  deploy permissions scoped to just the `deploy` job, and build provenance (IDF version, target,
+  the vendored HaLow component's hash) added to the published manifest - the shell logic dry-run
+  locally against real build artifacts and git history, not just YAML-parsed. The one still-open
+  P0 is a power-delivery regression tracked under F06, now seen on both bench boards - see that
+  item directly under F06; a powered hub is the next planned test)
 
 Keep this file current: tick the checklist when a step passes, move an item out of "not built yet"
 when it lands, and add to "settled decisions" rather than re-arguing one. Historical detail
@@ -746,13 +751,10 @@ errors, zero warnings, binary size unchanged at 41% free. Not yet verified on ha
       a better return on the same hours. Revisit if/when this project moves toward hardware given to
       people who aren't the operator, at which point budget real time for the "test on designated
       hardware" step the review insists on rather than rushing it.
-- [x] F16 (`patch_vendored_halow.py`'s partial-patch bug only - CI action/container pinning, deployment
-      permission scoping, build-artifact provenance recording, the discarded `mmhalow_wifi_start()`
-      return status, and an automated regression suite are all still open, see below) — P2 —
-      vendor-patch verification is marker-only; build identity isn't recorded/reproducible. **Fixed
-      the one concrete, self-contained, locally-testable bug in this finding - the CI/supply-chain
-      items are a different risk category (shared pipeline config, not verifiable the way this
-      session verifies firmware) and were left for a dedicated pass instead.**
+- [x] F16 (`patch_vendored_halow.py`'s partial-patch bug, plus a follow-up CI-hardening pass - the
+      discarded `mmhalow_wifi_start()` return status, a container-identity pin, and an automated
+      regression suite are still open, see below) — P2 — vendor-patch verification is marker-only;
+      build identity isn't recorded/reproducible.
 
       `patch_file()` in `patch_vendored_halow.py` applied `mmhalow.c`'s two separate replacements
       (`halow_transmit()`'s VIF fix and `mmhalow_wifi_start()`'s `ap_mode_enabled = true`) under one
@@ -785,13 +787,55 @@ errors, zero warnings, binary size unchanged at 41% free. Not yet verified on ha
       against the pre-test backup) before a real `idf.py build` confirmed zero errors/warnings and an
       unchanged binary size - only the Python script changed, no C source did.
 
-      **Left open, deliberately**: pinning CI action/container identities and scoping deployment
-      permissions, avoiding untrusted ref interpolation in CI shell scripts, recording build
-      provenance (compiler/IDF/component/BCF versions and hashes, config digest, patch digest, app
-      revision, dirty state) in build artifacts, and a maintained automated regression suite - all
-      real, but each its own scoped pass, not a same-session bundle with a Python correctness fix.
-      Also still open: `mmhalow_wifi_start()` itself discards `mmwlan_ap_enable()`'s return status
-      (a C/firmware change, a different kind of fix than this script), and testing PlatformIO as a
+      **Follow-up CI-hardening pass, same session, `.github/workflows/build-firmware.yml`** - the
+      review's remaining "Implement" items for this finding, weighed and mostly landed:
+
+      1. **Every third-party action was pinned to a mutable version tag** (`actions/checkout@v4`,
+         `espressif/esp-idf-ci-action@v1`, etc.) - a tag can be silently moved to point at different
+         code, the exact supply-chain risk the review names ("CI pins IDF 5.5.1 but action tags
+         remain mutable"). Worse than assumed for one of them: `espressif/esp-idf-ci-action@v1`
+         isn't a tag at all - `v1.0.0`/`v1.1.0`/`v1.2.0` exist as tags, but `v1` itself is a
+         *branch*, more routinely force-moved than a tag ever should be. Fixed by resolving each
+         `@vN` to its actual current commit SHA via the GitHub API and pinning to that, with the
+         version kept as a trailing comment for readability - confirmed for every action used
+         (`actions/checkout`, `actions/cache`, `actions/upload-artifact`,
+         `actions/download-artifact`, `actions/upload-pages-artifact`, `actions/deploy-pages`,
+         `espressif/esp-idf-ci-action`), not assumed to already be safe.
+      2. **Untrusted ref interpolation, the exact pattern the review names** - `REF_NAME="${{
+         github.ref_name }}"` inside a `run:` shell block. GitHub template-substitutes `${{ }}`
+         expressions directly into the script's *text* before the shell ever runs it, so a
+         crafted branch/tag name becomes part of the command line, not a quoted value - the
+         standard GitHub Actions script-injection pattern. Fixed by reading
+         `$GITHUB_REF_NAME`/`$GITHUB_REF_TYPE` instead - environment variables GitHub already sets
+         for every step, so the shell only ever sees the value as data, never as script text.
+      3. **Deployment permissions were workflow-wide** (`pages: write`/`id-token: write` inherited
+         by every job, including `build`, which never touches Pages) instead of scoped to the job
+         that actually needs them. Fixed by moving those two to just the `deploy` job -
+         `actions/upload-pages-artifact` (used by `assemble`) just packages a regular workflow
+         artifact under a reserved name and needs no elevated permission; only
+         `actions/deploy-pages` calls the actual Pages API.
+      4. **Build provenance**: the manifest already recorded the git SHA/date/title; extended it
+         with `idfVersion`/`target` (read from one new job-level `env:` block that also now backs
+         the `esp_idf_version`/`target` action inputs and the ccache keys, replacing three
+         previously-independent hardcoded copies of the same two strings) and
+         `halowComponentHash` (read directly out of `dependencies.lock`, not re-derived - the exact
+         vendored `morsemicro/halow` build this binary was compiled against). `dirty: false` is
+         recorded explicitly too, since a CI build is always from a clean checkout, unlike a local
+         `idf.py build`'s `-dirty` suffix.
+
+      **Verified without needing a CI run**: the workflow YAML parses (`python3 -c "import
+      yaml; yaml.safe_load(...)"`), and the entire "Assemble manifest + binaries" shell block -
+      the one with real logic, not just `uses:` lines - was dry-run locally against this session's
+      actual build artifacts and real git history (both the default-branch and the tag-release code
+      paths), producing a correct `current-build.json`/`manifest.json` with the real commit SHA,
+      title, and the real `halowComponentHash` pulled from `dependencies.lock`.
+
+      **Left open, deliberately**: `mmhalow_wifi_start()` itself still discards
+      `mmwlan_ap_enable()`'s return status (a C/firmware change, a different kind of fix than this
+      script or its CI); the `espressif/idf` Docker image used for the actual build is pinned by
+      version tag inside `esp-idf-ci-action`, not independently re-pinned to a digest here (would
+      need to track that action's own image-selection logic to pin correctly rather than duplicate
+      its version string); a maintained automated regression suite; and testing PlatformIO as a
       second build frontend against what's now ESP-IDF-only-verified.
 
 ### Stage F — measured optimization (needs A–D)

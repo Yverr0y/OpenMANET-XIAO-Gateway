@@ -14,8 +14,6 @@ on:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
   # Keyed by ref so a PR build doesn't cancel main's deploy, or vice versa.
@@ -32,9 +30,19 @@ jobs:
   # full evidence and the per-region breakdown.
   build:
     runs-on: ubuntu-latest
+    env:
+      # Single source of truth for the several places these need to match:
+      # the esp_idf_version/target passed to esp-idf-ci-action below, the
+      # ccache keys, and the manifest provenance recorded in "Assemble
+      # manifest + binaries" - review finding F16's "record ... IDF ...
+      # versions ... in build artifacts" (design/PROJECT_REVIEW_2026-09-10.md).
+      # Hardcoded second (or third, or fourth) copies of these strings would
+      # drift silently the next time one got updated and the others didn't.
+      IDF_VERSION: v5.5.1
+      TARGET: esp32s3
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
@@ -52,13 +60,13 @@ jobs:
       # all. ccache itself is already installed in the espressif/idf image
       # (esp-idf tools/docker/Dockerfile lists it in the apt install block).
       - name: Restore ccache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         id: restore-ccache
         with:
           path: .ccache
-          key: ccache-${{ runner.os }}-idf5.5.1-esp32s3-${{ github.sha }}
+          key: ccache-${{ runner.os }}-idf-${{ env.IDF_VERSION }}-${{ env.TARGET }}-${{ github.sha }}
           restore-keys: |
-            ccache-${{ runner.os }}-idf5.5.1-esp32s3-
+            ccache-${{ runner.os }}-idf-${{ env.IDF_VERSION }}-${{ env.TARGET }}-
 
       # Builds inside the official espressif/idf Docker image for the pinned
       # version - avoids the local-toolchain gotchas found setting this up by
@@ -72,10 +80,10 @@ jobs:
       # tools/idf_py_actions/core_ext.py L380-383), so it has to be passed into
       # the container; extra_docker_args is the action's hook for that.
       - name: Build firmware
-        uses: espressif/esp-idf-ci-action@v1
+        uses: espressif/esp-idf-ci-action@9d38657f3d789ca759b2b37aaf5ceffbc42c4f0d # v1 branch head (no v1 tag exists upstream) as of 2026-09-11
         with:
-          esp_idf_version: v5.5.1
-          target: esp32s3
+          esp_idf_version: ${{ env.IDF_VERSION }}
+          target: ${{ env.TARGET }}
           path: "."
           extra_docker_args: >-
             -e IDF_CCACHE_ENABLE=1
@@ -89,11 +97,11 @@ jobs:
       # never pick up newly compiled objects), and the restore-keys prefix above
       # is what makes the previous build's cache the starting point.
       - name: Save ccache
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         if: always()
         with:
           path: .ccache
-          key: ccache-${{ runner.os }}-idf5.5.1-esp32s3-${{ github.sha }}
+          key: ccache-${{ runner.os }}-idf-${{ env.IDF_VERSION }}-${{ env.TARGET }}-${{ github.sha }}
 
       - name: Assemble manifest + binaries
         run: |
@@ -128,9 +136,20 @@ jobs:
           COMMIT_DATE="$(git log -1 --format=%cI)"
           COMMIT_TITLE="$(git log -1 --format=%s)"
 
-          # Check if this is a tag release
-          REF_NAME="${{ github.ref_name }}"
-          REF_TYPE="${{ github.ref_type }}"
+          # Check if this is a tag release. Read from the environment
+          # (GITHUB_REF_NAME/GITHUB_REF_TYPE - GitHub sets both automatically
+          # for every step: https://docs.github.com/en/actions/learn-github-actions/variables#default-environment-variables),
+          # not `${{ github.ref_name }}` template-interpolation - review
+          # finding F16 (design/PROJECT_REVIEW_2026-09-10.md), "avoid directly
+          # interpolating untrusted ref names into shell scripts". A ref name
+          # interpolated via `${{ }}` is substituted into this script's *text*
+          # before the shell ever runs it, so a branch/tag name containing
+          # shell metacharacters becomes part of the command line, not a
+          # quoted value - the classic GitHub Actions script-injection
+          # pattern. Reading it as an environment variable instead means the
+          # shell only ever sees it as data.
+          REF_NAME="${GITHUB_REF_NAME}"
+          REF_TYPE="${GITHUB_REF_TYPE}"
 
           if [ "${REF_TYPE}" = "tag" ] || echo "${REF_NAME}" | grep -qE '^v[0-9]'; then
             IS_RELEASE="true"
@@ -167,9 +186,25 @@ jobs:
           # Root manifest default
           cp "${BUILD_DIR}/manifest.json" site/manifest.json
 
-          export BUILD_ID VERSION SHORT_SHA FULL_SHA COMMIT_DATE COMMIT_TITLE IS_RELEASE
+          export BUILD_ID VERSION SHORT_SHA FULL_SHA COMMIT_DATE COMMIT_TITLE IS_RELEASE IDF_VERSION TARGET
+          # Review finding F16 (design/PROJECT_REVIEW_2026-09-10.md): "record
+          # ... IDF/component/BCF versions and hashes, config digest, patch
+          # digest, application revision and dirty state in build artifacts."
+          # applicationRevision/dirty are covered by sha/fullSha above (a CI
+          # build is always from a clean checkout, never dirty, unlike a local
+          # `idf.py build`'s "-dirty" suffix - see CLAUDE.md/ROADMAP.md for
+          # that convention). idfVersion/target come from the same env this
+          # step's build command used, not a second hand-typed copy - see
+          # that env block's own comment. halowComponentHash is read directly
+          # out of dependencies.lock (not re-derived or assumed) - the exact
+          # vendored morsemicro/halow build this binary was compiled against,
+          # the one piece of this project that isn't its own source.
           python3 -c "
-          import json, os
+          import json, os, re
+          with open('dependencies.lock') as f:
+              lock = f.read()
+          m = re.search(r'component_hash:\s*(\S+)', lock)
+          halow_hash = m.group(1) if m else None
           data = {
               'id': os.environ['BUILD_ID'],
               'version': os.environ['VERSION'],
@@ -178,14 +213,18 @@ jobs:
               'date': os.environ['COMMIT_DATE'],
               'title': os.environ['COMMIT_TITLE'],
               'isRelease': os.environ['IS_RELEASE'].lower() == 'true',
-              'manifest': f'builds/{os.environ[\"BUILD_ID\"]}/manifest.json'
+              'manifest': f'builds/{os.environ[\"BUILD_ID\"]}/manifest.json',
+              'idfVersion': os.environ['IDF_VERSION'],
+              'target': os.environ['TARGET'],
+              'halowComponentHash': halow_hash,
+              'dirty': False
           }
           with open('site/current-build.json', 'w') as f:
               json.dump(data, f, indent=2)
           "
 
       - name: Upload firmware artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: firmware
           path: site
@@ -196,16 +235,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Download firmware artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: firmware
           path: site
 
       - name: Restore builds history cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         id: restore-builds-cache
         with:
           path: build_history
@@ -302,7 +341,7 @@ jobs:
           EOF
 
       - name: Save builds history cache
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         if: always()
         with:
           path: build_history
@@ -312,7 +351,7 @@ jobs:
         run: cp docs/index.html site/
 
       - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v4
+        uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4.0.0
         with:
           path: site
 
@@ -320,10 +359,21 @@ jobs:
     needs: assemble
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    # Review finding F16 (design/PROJECT_REVIEW_2026-09-10.md): "give
+    # deployment permissions only to deployment jobs" - this is the only job
+    # that actually calls the Pages deploy API (id-token is the OIDC token
+    # that authenticates the deployment, pages is what lets it create one).
+    # build/assemble above never touch Pages - actions/upload-pages-artifact
+    # just packages a regular workflow artifact under a reserved name, no
+    # elevated permission needed - so they run under the workflow-level
+    # `contents: read` default instead of inheriting these too.
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5
