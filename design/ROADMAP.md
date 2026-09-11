@@ -11,27 +11,16 @@ you're picking the project back up.**
 - Companion docs: [`HARDWARE.md`](HARDWARE.md) (what to buy, how to build one, how to bring it up),
   [`PI_SIDE.md`](PI_SIDE.md) (the other end of the link)
 - Architecture diagram and repo layout: [`../README.md`](../README.md)
-- **Last updated:** 2026-09-11 (Stage B complete - F06/F07/F08/F11/F13; Stage C complete -
-  F02/F03/F15/F14's migration portion; each scoped down from the review's fuller design to the
-  concrete, demonstrable bug within it - see the Stage B/C entries below for what was fixed vs.
-  deliberately left open in each. Both F15 and F14 landed with genuine hardware before/afters: F15's
-  old single-slot challenge bug was accidentally reproduced live during testing, then confirmed fixed
-  across four repeat runs after reflashing; F14's migration fix was verified by simulating a real
-  version bump against a board with a real marker config, which the fix's first pass still lost - a
-  second pass (gating `tls_identity.c`'s auto-persist) then proved to preserve it intact across the
-  identical round trip. With Stage B/C closed out, a 3h39m relay+leaf stability soak (see "What the
-  Sep 11 stability soak proved" under item 8) found zero reboots, zero heap leaks, and 99.4% CoT
-  delivery with the last 650 packets at 0% loss - the review-tracker work didn't regress basic link
-  stability. Stage D then landed a scoped F09 fix (destination-group validation), closing a real
-  open-relay gap - a unicast datagram sent straight at either interface used to get amplified to
-  multicast on the other side; verified directly with a live probe packet against the same bench
-  pair. Stage D's F12 then landed too (honest DHCP-pause logging + real hysteresis on both shed
-  decisions), verified with a live hardware transition capture. Stage D is now complete
-  (F09 + F12); only Stage E remains. The still-open P0 power-delivery regression under F06 gained a
-  second data point during F12's verification - the leaf board (previously stable through the whole
-  soak and F09 test) showed the identical crash signature while being reflashed, consistent with the
-  issue extending beyond one board/cable rather than a code regression - see the item directly under
-  F06; a powered hub is still the next planned test)
+- **Last updated:** 2026-09-11 (2026-09-10 review tracker: Stages A-D all complete - every finding
+  scoped down from the review's fuller design to its concrete, demonstrable bug, each verified on
+  real hardware or (F16) against the real vendored files locally - see the "2026-09-10 review
+  tracker" section below for the full per-finding story, including two genuine hardware
+  before/afters (F15, F14) and a real regression-suite-style test of `patch_vendored_halow.py`
+  (F16). Stage E's secure boot/flash encryption (F14 production profile) is deliberately deferred,
+  not built - see that item's own entry for the cost/benefit reasoning. F16's remaining CI/build-
+  provenance items are still open. The one still-open P0 is a power-delivery regression tracked
+  under F06, now seen on both bench boards - see that item directly under F06; a powered hub is the
+  next planned test)
 
 Keep this file current: tick the checklist when a step passes, move an item out of "not built yet"
 when it lands, and add to "settled decisions" rather than re-arguing one. Historical detail
@@ -757,7 +746,53 @@ errors, zero warnings, binary size unchanged at 41% free. Not yet verified on ha
       a better return on the same hours. Revisit if/when this project moves toward hardware given to
       people who aren't the operator, at which point budget real time for the "test on designated
       hardware" step the review insists on rather than rushing it.
-- [ ] F16 — P2 — vendor-patch verification is marker-only; build identity isn't recorded/reproducible
+- [x] F16 (`patch_vendored_halow.py`'s partial-patch bug only - CI action/container pinning, deployment
+      permission scoping, build-artifact provenance recording, the discarded `mmhalow_wifi_start()`
+      return status, and an automated regression suite are all still open, see below) — P2 —
+      vendor-patch verification is marker-only; build identity isn't recorded/reproducible. **Fixed
+      the one concrete, self-contained, locally-testable bug in this finding - the CI/supply-chain
+      items are a different risk category (shared pipeline config, not verifiable the way this
+      session verifies firmware) and were left for a dedicated pass instead.**
+
+      `patch_file()` in `patch_vendored_halow.py` applied `mmhalow.c`'s two separate replacements
+      (`halow_transmit()`'s VIF fix and `mmhalow_wifi_start()`'s `ap_mode_enabled = true`) under one
+      whole-file marker check: if the marker string appeared *anywhere* in the file, the function
+      returned immediately, without checking - let alone applying - the second replacement. A file
+      where only the first replacement had ever landed (an interrupted prior run, a hand-edit, a
+      partially-written checkout) would be silently accepted as "already patched, nothing to do" -
+      exit 0, no error - while `mmhalow_wifi_start()` never actually set `ap_mode_enabled`. That's a
+      silent reintroduction of the exact VIF-inference bug (design/ROADMAP.md's own Aug 30 findings)
+      this script exists to prevent, with nothing telling anyone it happened.
+
+      Fixed by checking each replacement's own already-applied (`new`) text independently instead of
+      one shared marker: a replacement already present is skipped on its own merits; a replacement
+      whose text matches neither the pre-patch nor post-patch form (a genuinely changed/unknown
+      upstream shape) fails loudly, exit 1, rather than guessing - the review's own "reject
+      mixed/unknown states" ask.
+
+      **Verified locally against the real vendored files, not a synthetic fixture** (no hardware
+      needed - this is a pure Python/file-content fix): backed up the real, fully-patched
+      `mmhalow.c`/`.h`, then exercised all four states directly against them - (1) fully patched:
+      unchanged, "nothing to do"; (2) fully unpatched (both files reverted to their pre-patch form):
+      applies cleanly, byte-identical to the known-good patched state afterward; (3) **the actual bug
+      scenario** - `halow_transmit()` patched, `mmhalow_wifi_start()` reverted to its pre-patch form
+      alone - confirmed the *old* logic (checked directly, not assumed) would have seen the marker
+      from the first replacement and silently accepted the file as fully patched, leaving
+      `mmhalow_wifi_start()` broken; the *new* logic correctly detected and completed exactly that
+      one missing replacement, byte-identical to the known-good state afterward; (4) a deliberately
+      unrecognizable edit to `mmhalow_wifi_start()`: correctly failed loudly (exit 1) rather than
+      silently accepting or guessing. Real vendored files restored exactly (diffed byte-for-byte
+      against the pre-test backup) before a real `idf.py build` confirmed zero errors/warnings and an
+      unchanged binary size - only the Python script changed, no C source did.
+
+      **Left open, deliberately**: pinning CI action/container identities and scoping deployment
+      permissions, avoiding untrusted ref interpolation in CI shell scripts, recording build
+      provenance (compiler/IDF/component/BCF versions and hashes, config digest, patch digest, app
+      revision, dirty state) in build artifacts, and a maintained automated regression suite - all
+      real, but each its own scoped pass, not a same-session bundle with a Python correctness fix.
+      Also still open: `mmhalow_wifi_start()` itself discards `mmwlan_ap_enable()`'s return status
+      (a C/firmware change, a different kind of fix than this script), and testing PlatformIO as a
+      second build frontend against what's now ESP-IDF-only-verified.
 
 ### Stage F — measured optimization (needs A–D)
 - [ ] Cache radio/status into one supervisor snapshot (removes concurrent driver calls from HTTP/timer paths)

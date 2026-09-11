@@ -21,8 +21,6 @@ the thing to check before assuming it's still needed).
 """
 import sys
 
-MARKER = "LOCAL PATCH (OpenMANET-XIAO-Gateway"
-
 HEADER_PATH = "managed_components/morsemicro__halow/mmhalow.h"
 HEADER_OLD = """typedef struct mmhalow_netif_driver
 {
@@ -98,23 +96,51 @@ SOURCE_NEW_START = """void mmhalow_wifi_start(){
 
 
 def patch_file(path, replacements):
+    """Applies each (old, new) pair in replacements to the file at path,
+    independently - not gated by a single whole-file marker check.
+
+    Review finding F16 (design/PROJECT_REVIEW_2026-09-10.md): this function
+    used to check one marker string against the *whole file* before applying
+    *any* replacement, on the theory that the marker's presence anywhere
+    proves the whole file is patched. That's false for mmhalow.c, which gets
+    two separate replacements in one call (SOURCE_OLD_TRANSMIT and
+    SOURCE_OLD_START below) - if only the first had ever been applied (an
+    interrupted prior run, a hand-edit, a partially-written file), the old
+    code would see that one replacement's marker text, conclude the *entire*
+    file was already patched, and silently skip the second - leaving
+    mmhalow_wifi_start() never setting ap_mode_enabled while halow_transmit()
+    already depends on it being set correctly. That's a real, silent
+    reintroduction of the exact bug this patch exists to fix, with no error
+    and a "nothing to do" exit code.
+
+    Fixed by checking each replacement's own *already-applied* text (`new`)
+    independently: a replacement already present is skipped on its own,
+    without assuming anything about the others in the same file. A
+    replacement whose text is in neither the pre-patch (`old`) nor
+    post-patch (`new`) form is treated as a genuinely unrecognized/mixed
+    state - the case the review calls out to reject rather than guess at -
+    and fails loudly rather than silently leaving that one incomplete. """
     with open(path, "r") as f:
         content = f.read()
 
-    if MARKER in content:
-        return False  # already patched
-
+    original = content
     for old, new in replacements:
+        if new in content:
+            continue  # this specific change is already applied - fine
         if old not in content:
             sys.stderr.write(
-                "patch_vendored_halow.py: expected text not found in %s - "
-                "the vendored file has changed shape (a component version "
-                "bump?) and this patch needs re-verifying by hand before it "
-                "can be reapplied blindly. Failing loudly rather than "
-                "silently skipping the fix.\n%s\n" % (path, old[:200])
+                "patch_vendored_halow.py: expected text not found in %s, and "
+                "the already-patched form isn't there either - the vendored "
+                "file has changed shape (a component version bump?) or is in "
+                "an unrecognized mixed state, and this patch needs "
+                "re-verifying by hand before it can be reapplied blindly. "
+                "Failing loudly rather than guessing.\n%s\n" % (path, old[:200])
             )
             sys.exit(1)
         content = content.replace(old, new, 1)
+
+    if content == original:
+        return False  # every individual replacement was already present
 
     with open(path, "w") as f:
         f.write(content)
