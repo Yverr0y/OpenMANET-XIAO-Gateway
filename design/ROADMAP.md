@@ -830,13 +830,31 @@ errors, zero warnings, binary size unchanged at 41% free. Not yet verified on ha
       paths), producing a correct `current-build.json`/`manifest.json` with the real commit SHA,
       title, and the real `halowComponentHash` pulled from `dependencies.lock`.
 
+      **Time-based pinning added, 2026-09-11** (`.github/dependabot.yml`, new): SHA-pinning alone
+      doesn't defend against adopting a *freshly published* malicious release the moment it lands -
+      most supply-chain compromises are caught and pulled within days once the community notices, so
+      a deliberate delay before a newly-published version is even proposed is cheap insurance against
+      exactly that window. `cooldown.default-days: 14` on the `github-actions` ecosystem (confirmed
+      against the authoritative schema, `schemastore.org/dependabot-2.0.json` - the field only exists
+      as documented there, not assumed from memory) means Dependabot won't open a PR bumping to a new
+      action release until it's been public for two weeks. Scoped to `github-actions` only - it's the
+      one dependency surface here Dependabot actually understands; the ESP-IDF version and the
+      vendored `morsemicro/halow` component are both managed by ESP-IDF's own component manager,
+      which Dependabot doesn't recognize as an ecosystem, so the same wait-before-bumping discipline
+      for those two has to stay a documented manual policy rather than automated - noted in this
+      item's own comment for whoever bumps either by hand.
+
+      **PlatformIO tested, confirmed incompatible, 2026-09-11** - not "left open," a settled no: a
+      `.pio/` directory in this repo shows it was actually tried, and it doesn't build against the
+      vendored `morsemicro/halow` component as this project uses it. Dropped from this finding's scope
+      entirely rather than carried forward as still-open work.
+
       **Left open, deliberately**: `mmhalow_wifi_start()` itself still discards
       `mmwlan_ap_enable()`'s return status (a C/firmware change, a different kind of fix than this
       script or its CI); the `espressif/idf` Docker image used for the actual build is pinned by
       version tag inside `esp-idf-ci-action`, not independently re-pinned to a digest here (would
       need to track that action's own image-selection logic to pin correctly rather than duplicate
-      its version string); a maintained automated regression suite; and testing PlatformIO as a
-      second build frontend against what's now ESP-IDF-only-verified.
+      its version string); and a maintained automated regression suite - see the new item below.
 
 ### Stage F — measured optimization (needs A–D)
 - [ ] Cache radio/status into one supervisor snapshot (removes concurrent driver calls from HTTP/timer paths)
