@@ -3,11 +3,17 @@
 Where this project is, what's next, and the decisions that shouldn't be re-made. **Start here if
 you're picking the project back up.**
 
+- **2026-09-10 review:** [`PROJECT_REVIEW_2026-09-10.md`](PROJECT_REVIEW_2026-09-10.md)
+  contains the code, routing, security and optimization audit, prioritized implementation stages,
+  and acceptance tests. Recommendations are pending implementation; its new build/host checks
+  do not replace the hardware validation gates below.
+
 - Companion docs: [`HARDWARE.md`](HARDWARE.md) (what to buy, how to build one, how to bring it up),
   [`PI_SIDE.md`](PI_SIDE.md) (the other end of the link)
 - Architecture diagram and repo layout: [`../README.md`](../README.md)
-- **Last updated:** 2026-08-30 (PSRAM + heap-pressure shedding, 1-2MHz HaLow bandwidth confirmed on
-  hardware, MeshCore coexistence tested clean at short range - range test planned, not yet run)
+- **Last updated:** 2026-09-10 (2026-09-10 review's Stage A landed in full; F02's HTTPS/per-device-
+  identity switch landed and confirmed booting/serving on real hardware - see "Settled decisions →
+  Authentication → TLS")
 
 Keep this file current: tick the checklist when a step passes, move an item out of "not built yet"
 when it lands, and add to "settled decisions" rather than re-arguing one. Historical detail
@@ -20,9 +26,10 @@ FGH100M-H — 902–928 MHz, US only.** One build, `CONFIG_HALOW_COUNTRY_CODE="U
 decisions" and [`HARDWARE.md`](HARDWARE.md) "Regulatory domain".
 
 `idf.py build` **passes end-to-end** against ESP-IDF v5.5.1 with the real `morsemicro/halow`
-component: **zero errors, zero warnings**, binary **~1.77 MB (`0x1c6100`)**, **41% free** in the
+component: **zero errors, zero warnings**, binary **~1.84 MB (`0x1d7bd0`)**, **39% free** in the
 3 MB app slot on confirmed 8 MB flash. Verified by actually running the build, not by reading code.
-(The 1% drop from PSRAM init code + `heap_guard.c` - see "What's implemented" below - is noise
+(The 2% drop since the last figure below is `esp_https_server` + mbedtls's X.509/PK write code for
+the 2026-09-10 HTTPS switch - see "Settled decisions → Authentication → TLS" - ~71 KB, still noise
 next to the margin this slot has.)
 
 That is 182,464 bytes (178 KB, 9.1%) smaller than the ~1.92 MB / 36% this sat at through the
@@ -154,6 +161,156 @@ again in place; there is no separate step for this.
       first use, lockout/backoff, `gwcfg-reset-auth` recovery. See item 1 under "Not built yet" for
       the full design and what's still only exercised in the lab (mobile-browser PBKDF2 timing,
       session-idle timeout, the lockout's later backoff windows).
+
+## 2026-09-10 review tracker
+
+Tracks implementation of [`PROJECT_REVIEW_2026-09-10.md`](PROJECT_REVIEW_2026-09-10.md) (codex,
+external review — source baseline `ba4898e`). Tick a finding only once its own acceptance criteria
+in the review pass, not merely when the diff compiles — same discipline as the build-order checklist
+above. Findings are grouped into the review's own stages (A–F); a stage's exit gate is in the
+review's §8 table.
+
+**Before Stage C: F02 conflicts with a settled decision.** F02 recommends HTTPS for management;
+"Settled decisions" → Authentication → TLS above says **No**, with reasons (no CA for a private IP,
+a self-signed cert trains users past browser warnings, RAM cost) that the review does not appear to
+have read or address. Don't implement F02 as written until that's resolved one way or the
+other — either the settled decision gets overturned with a recorded reason, or F02 gets re-scoped to
+work inside it (e.g. protecting the existing challenge-response flow further without TLS).
+
+### Stage A — immediate correctness (no dependencies) — **done, 2026-09-10**
+- [x] F01 — P0 — `cot_relay_get_counters()` reads an uninitialized relay mutex. Fixed: returns
+      zero counters when `s_send_lock` is still NULL instead of taking it.
+- [x] F04 — P0 — DNS forwarder response matching insufficient. Fixed: the forwarder now rewrites
+      the transaction ID to one it chose (removes the multi-client-same-ID collision), and a reply
+      must match that ID, the exact resolver address:port queried, and the original question bytes
+      before it's relayed - RFC 5452 §9.2's three fields, all three now checked.
+- [x] F05 — P1 — DNS truncation handling doesn't match the TCP-fallback comment. Fixed: both the
+      query and reply paths use `recvmsg()` and drop (rather than forward) anything the real
+      datagram length shows was truncated; the misleading "TC bit" comment is corrected. Full TCP
+      fallback is still not implemented - an oversize reply is dropped, not served, which is the
+      honest behavior but not complete DNS service. Left as future work if a real deployment needs
+      EDNS0-sized replies.
+- [x] F10 — P1 — **fully fixed, 2026-09-10.** `provisioning_parse_security()` now returns
+      success/failure instead of defaulting unknown strings to open, and every caller (console +
+      web UI) rejects on failure. Web UI JSON numeric fields (softap channel, HaLow AP
+      op_class/s1g_chan_num/max_stas, CoT port) validate type/integer-ness/range against the full
+      `double` before narrowing, instead of casting `cJSON`'s `valueint` directly. A new
+      `validate_host_subnet()` helper (`main/provisioning.c`) rejects non-contiguous masks,
+      all-zero masks, an IP that's the network or broadcast address of its own subnet, and a
+      gateway outside that subnet - applied to the uplink's static IP, the SoftAP's custom subnet,
+      and the HaLow AP's subnet. A new `subnets_overlap()` check rejects a client-role static
+      uplink whose subnet overlaps its own SoftAP's (the one cross-config overlap that's actually
+      checkable at validate time - `wifi_uplink` is DHCP-only and unknown until associated, and
+      `softap`/`halow_ap` never coexist on one node). The two bit-tricks (contiguous-mask test,
+      overlap test) were spot-checked against a standalone host program before trusting them,
+      including this project's own real default subnets (172.16.50.0/24 SoftAP vs. 172.16.60.0/24
+      HaLow AP correctly non-overlapping). **Still open, lower priority**: the same
+      integer-narrowing pattern in `provisioning.c`'s console setters (`atoi()` results cast
+      straight to narrow types) - a physically-present serial operator is a materially different
+      threat model than an HTTP client, so left for a future pass rather than this one.
+- [x] F17 (boundary bug only) — P2 — log ring `s_wrapped` misses an exact-boundary wrap. Fixed:
+      replaced the wrap-detecting bool with an explicit valid-byte count (`s_count`), capped at
+      `LOG_RING_SIZE`, so a full ring reads back full regardless of how many writes it took to fill it.
+- [x] Safe auth-init failure. Fixed: added `auth_is_ready()`; `web_ui_start()` now refuses to start
+      (logs and returns `ESP_ERR_INVALID_STATE`) rather than serve a management interface no auth
+      call can safely gate against a NULL mutex.
+
+Verified by a real `idf.py build` after each change (per this file's own discipline) - zero
+errors, zero warnings, binary size unchanged at 41% free. Not yet verified on hardware.
+
+### Stage B — ownership and recovery (needs A)
+- [ ] F06 — P0 — non-TX Morse radio API calls have no shared owner/serialization
+- [ ] F07 — P1 — scan timeout doesn't synchronize against callback lifetime
+- [ ] F08 — P1 — datapath bring-up is one-shot; recovery after address/partial-failure/timing races is incomplete
+- [ ] F11 — P1 — saved config and active network state are conflated (no desired/active split)
+- [x] F13 (explicit budget + margin) — P1 — **landed 2026-09-10, ahead of the rest of Stage B at the
+      user's direction.** The socket budget is now written down and computed, not implicit:
+      GW_ROLE_RELAY needs exactly 7 (HTTPS: `HTTPD_SSL_CONFIG_DEFAULT()`'s `max_open_sockets=4` + 3
+      esp_http_server.h reserves internally) + 1 (CoT) + 2 (DNS forwarder) = 10 sockets - precisely
+      `CONFIG_LWIP_MAX_SOCKETS`'s old Kconfig default, meaning the relay role was booting with *zero*
+      spare sockets for anything else lwIP might transiently need. Raised to 14 (+4 margin) in
+      `sdkconfig.defaults`, with the full accounting in its own comment. Real cost measured on
+      hardware (a GW_ROLE_RELAY node, idle, uplink associated, one HaLow leaf attached), not guessed:
+      free internal heap 103,279 → 101,579 bytes for the 4 extra slots (~425 bytes/socket) -
+      `MEMP_NUM_NETCONN == CONFIG_LWIP_MAX_SOCKETS` preallocates a real `struct netconn` per slot
+      regardless of whether it's ever opened, confirmed against `components/lwip/port/include/
+      lwipopts.h`. Reflashed both bench nodes after the change; relay/leaf reassociated and HTTPS
+      kept working (verified with `curl`) with no regression. **Still open from F13's original
+      scope**: "reserve datapath capacity before accepting management sessions" (an explicit
+      ordering/reservation guarantee, not just headroom - `web_ui_start()` still runs before
+      `datapath_task_start()` in `app_main.c`'s bring-up, so a burst of early browser connections
+      could in principle still race the datapath's own socket allocation at boot) and admission-
+      failure visibility/reject-cheaply for socket allocation itself (distinct from the HTTP-level
+      `max_open_sockets` LRU purge, which the review already confirmed rejects overload cleanly - see
+      the "Settled decisions" TLS row's load-test numbers). Both are more naturally part of F08's
+      supervisor work than a standalone follow-up.
+
+### Stage C — management security (needs A; B's snapshots/budgets) — **TLS conflict above now resolved**
+- [x] F02 (HTTPS transport) — P0 — **landed 2026-09-10, ahead of Stage B at the user's direction.** Web UI now
+      serves HTTPS only (`main/tls_identity.c`, `web_ui_start()`), self-signed per-device cert with
+      serial-console fingerprint verification - see the "Settled decisions → Authentication → TLS" row
+      above for the full design and hardware confirmation so far. Session cookies gained `Secure`;
+      credential/session/config responses gained `Cache-Control: no-store`. A real TLS client's
+      handshake and served-certificate fingerprint were verified end-to-end against a live two-node
+      bench pair, and `httpd` stack headroom (34% worst-case) was measured under real concurrent
+      TLS-handshake + CoT-injection load, not idle - see the "Settled decisions" row for the full
+      numbers. **Still open from F02's original scope**: reject-a-substituted-identity /
+      logout-revocation / persistence-failure test coverage, and revisiting the socket/RAM budget
+      once Stage B's F13 work lands (this session's 8-parallel-client test confirmed the existing
+      `max_open_sockets=4` cap rejects overload cleanly rather than exhausting memory, but F13 is
+      still where the deliberate budget across HTTP+DNS+CoT gets written down formally). The stored
+      key itself is
+      still password-equivalent-adjacent cleartext in NVS pending F14 - unchanged from before, not a
+      new gap this introduced.
+- [x] F03 — P1 — **landed 2026-09-10.** Claiming admin ownership (`POST /api/auth/password`,
+      first-use only) now also requires a per-device `setup_secret` - a random 128-bit value
+      generated at first unclaimed boot, logged once at boot and available any time via
+      `gwcfg-show-setup-secret` (the same physical-presence/TOFU model `tls_identity.c`'s
+      certificate fingerprint already established). The window closes after
+      `AUTH_ONBOARDING_BOOT_BUDGET` (10) boots without a claim - a boot count, not a wall-clock
+      timeout, since this board has no RTC - and stays closed across a plain reboot; only
+      `gwcfg-reopen-onboarding` (console, physically-present-only) reopens it. `GW_CONFIG_VERSION`
+      bumped 8→9 for the new `gw_auth_config_t` fields.
+      **A real ordering bug was caught by testing the actual HTTPS endpoint, not by review**: the
+      first implementation consumed the one-time PBKDF2 salt offer before checking the setup
+      secret, so a single wrong-secret attempt burned the salt and made the *next* attempt - even
+      with the correct secret - fail with `no_pending_salt`. Fixed by checking the setup secret
+      first, confirmed with a real end-to-end claim over HTTPS (`curl`/Python + real PBKDF2)
+      against a live bench relay: wrong secret correctly rejected (401 `bad_setup_secret`) without
+      disturbing the salt offer, then the same salt offer with the correct secret succeeded and
+      returned a working session cookie. `auth_init()`'s boot-time bookkeeping deliberately mutates
+      the global config in place rather than using a `gw_config_t`-sized stack local, for the same
+      thin-"main"-task reason documented on `GW_STACK_TLS_IDENTITY_GEN` (task_stats.h) - not
+      re-tested to failure this time, fixed proactively from that lesson instead.
+      **Unrelated environmental finding during this work, worth recording**: a flaky USB
+      cable/power connection on the bench caused repeated `power-on` resets (confirmed via the
+      logged reset reason and `journalctl` USB disconnect/reconnect events) that looked like a
+      firmware crash loop but was not one - every captured boot completed cleanly with no panic.
+      The same flaky power window most likely corrupted an in-progress NVS write, since both bench
+      nodes came back at default config after cable reseating and had to be reprovisioned - a
+      real-world case for F14's eventual "power loss during save recovers coherently" acceptance
+      criterion, not a defect introduced here.
+- [ ] F15 — P2 — auth challenge state is single/global, not per-transaction
+- [ ] F14 (migration portion) — P1 — schema-bump/corrupt-config paths can silently reset ownership
+
+### Stage D — multi-node forwarding (needs A/B)
+- [ ] F09 — P1 — CoT relay has no destination-group check, dedup cache, or rate budget
+- [ ] F12 — P1 — heap-shedding's DHCP pause doesn't actually stop new associations/traffic
+
+### Stage E — deployment hardening (needs B/C/D)
+- [ ] F14 (production profile) — P1 — flash/NVS encryption, secure boot, core-dump handling as one lifecycle
+- [ ] F16 — P2 — vendor-patch verification is marker-only; build identity isn't recorded/reproducible
+
+### Stage F — measured optimization (needs A–D)
+- [ ] Cache radio/status into one supervisor snapshot (removes concurrent driver calls from HTTP/timer paths)
+- [ ] Make scans asynchronous and bounded (job-ID pattern instead of blocking the HTTP task)
+- [ ] Profile before touching the 40 MHz SPI clock or NAPT table size
+- [ ] Pick and document an explicit Wi-Fi power-save policy, measured
+- [ ] Station-limit testing at 1/2/4 leaves before any "supports N clients" claim
+- [ ] Evaluate a supported AP-netif adapter before writing a DHCP server from scratch
+
+Regression suite T01–T12 and the acceptance targets in the review's §8 are the durable test list —
+add them as real tests alongside each stage's fixes, not as a follow-up pass.
 
 ## Not built yet
 
@@ -930,7 +1087,11 @@ Recorded so they aren't relitigated, and so they aren't accidentally undone.
 | Decision | Choice | Why |
 |---|---|---|
 | Default password | **Forced change on first use** | A fixed default is bad practice and likely non-compliant — California SB-327 and the UK PSTI Act each require a unique per-device credential or a forced change at setup. This board has no screen and no per-unit labelling step, so per-device randomness can't be communicated. |
-| TLS | **No** | No CA issues certificates for a private IP, and a self-signed cert trains users to click through browser warnings — worse than no TLS, because it erodes the one signal that matters elsewhere. TLS also costs RAM on a device already running NAT and the relay. WPA2 on the SoftAP is the transport protection. |
+| TLS | **Yes, since 2026-09-10** — self-signed per-device ECDSA P-256 cert, fingerprint verified like an SSH host key | **Supersedes this row's original "No."** Original reasoning (no CA for a private IP; a self-signed cert trains users to click through warnings; RAM cost) didn't have an answer for the click-through problem or the RAM cost — this does: (1) the device generates its own cert at first boot and prints its SHA-256 fingerprint on the serial console (`gwcfg-show-cert`), so an operator verifies it once out-of-band before trusting the browser warning — TOFU, the same model SSH host keys and every home router/Ubiquiti/pfSense admin panel already use, not blind click-through; (2) `CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC` routes mbedtls's ~40KB-per-connection buffers into the 8MB PSRAM pool (added 2026-08-30) instead of the ~512KB internal SRAM this project guards closely — see sdkconfig.defaults' own comment for the exact figures and the accepted tradeoff (cleartext in PSRAM without flash encryption, same risk class as the admin credential/radio passphrases already sitting in cleartext NVS). Implemented in `main/tls_identity.c`; review finding F02, `design/PROJECT_REVIEW_2026-09-10.md`.
+
+Confirmed on real hardware, two physical nodes bridged over HaLow (relay on a real home Wi-Fi AP, a leaf associated to the relay's HaLow AP - the same two-node bench pair prior sessions used): HTTPS server starts (`esp_https_server: Server listening on port 443`), identity generates once and persists across reboots (same fingerprint after a reflash), `gwcfg-show-cert`/`gwcfg-reset-tls-identity` work. **A real independent TLS client completed the full handshake and fetched content** (`curl -k` from a machine sharing the relay's Wi-Fi uplink network: `HTTP 200`, handshake ~0.5s) and **its served certificate's SHA-256 fingerprint exactly matched `gwcfg-show-cert`'s console output** (`openssl s_client | openssl x509 -fingerprint -sha256`) - the actual TOFU property this design depends on, verified end-to-end rather than assumed.
+
+**Stack headroom measured under real concurrent load, not idle** (2026-09-10): 8 parallel TLS clients (deliberately over `HTTPD_SSL_CONFIG_DEFAULT()`'s `max_open_sockets=4`) plus a 300-packet CoT injection (`gwcfg-cot-test`) running simultaneously through the same relay. `httpd`'s worst-case-ever mark across the run: **6748/10240 bytes free (34% used)** - comfortably inside this project's safe band, well clear of the "tight" (<512B) and "CRITICAL" (<256B) thresholds "Stack budgets" below defines. Free internal heap dropped from ~103KB to ~49.5KB at the low point (recovered fully after the load stopped) - below `heap_guard.c`'s CoT-shed threshold, so its shedding path was very likely exercised live, not just in theory. The overload itself produced clean, expected errors, not memory corruption: `MBEDTLS_ERR_NET_CONN_RESET` (-0x0050) and `MBEDTLS_ERR_SSL_CONN_EOF` (-0x7280) - both confirmed against real mbedtls source to mean "the client gave up and closed the connection" (curl's own `--max-time 3` triggering exactly as expected against a socket cap sized for ~1-2 real admin browsers, not 8 synthetic ones), not a resource-exhaustion or allocation-failure code. Node fully recovered after the load stopped: heap back to baseline, all subsystems still running, no reboot. |
 | Password on the wire | **Challenge-response** — server issues a nonce, client returns `HMAC(stored_key, nonce)` | With WPA2-PSK, anyone who knows the AP passphrase can decrypt other clients' traffic. A team may share the Wi-Fi passphrase without every member being an administrator. |
 | Browser crypto | **A bundled ~2 KB SHA-256/HMAC** | ⚠️ `crypto.subtle` is only exposed in *secure contexts*, and `http://172.16.50.1` is not one (only `localhost` is trusted over plain HTTP). **Do not "simplify" this back to WebCrypto later — it will silently be `undefined` on the device.** |
 | Storage | PBKDF2-HMAC-SHA256, per-device random salt in NVS | Implemented 2026-08-30 - see item 1. The KDF itself runs client-side (mbedtls is only used on-device for the one HMAC-SHA256 verification at login, added to `main/CMakeLists.txt`'s `PRIV_REQUIRES` - it was not previously a `main` dependency, correcting this row's earlier claim). Never store the password itself. Logins are rare, so err high on iterations. |

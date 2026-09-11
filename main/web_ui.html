@@ -587,6 +587,12 @@
       <p class="hint">This node has no admin password yet. Set one to continue - it will be
         required for all further access, including the config UI you're looking at right now.</p>
       <div class="form-group">
+        <label for="authSetupSecret">Setup Code</label>
+        <input type="text" id="authSetupSecret" autocomplete="off" spellcheck="false">
+        <p class="hint">Read this off the device's serial console (<code>gwcfg-show-setup-secret</code>,
+          or the one-time line logged at boot) - proves you have physical access, not just Wi-Fi range.</p>
+      </div>
+      <div class="form-group">
         <label for="authNewPassword">New Password</label>
         <input type="password" id="authNewPassword" autocomplete="new-password">
       </div>
@@ -1308,7 +1314,7 @@ function showAuthScreen(mode, message) {
   el('authSetPasswordForm').hidden = !isSetPassword;
   el('authScreenTitle').textContent = isSetPassword ? 'Set Admin Password' : 'Sign In';
   if (isSetPassword) {
-    el('authSetPasswordHint').textContent = '';
+    el('authSetPasswordHint').textContent = message || '';
   } else {
     el('authLoginHint').textContent = message || '';
   }
@@ -2084,17 +2090,21 @@ el('authSetPasswordBtn').addEventListener('click', async function () {
     var setRes = await fetch('/api/auth/password', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ stored_key: storedKey })
+      body: JSON.stringify({ stored_key: storedKey, setup_secret: el('authSetupSecret').value.trim() })
     });
-    if (setRes.status === 401) { handleAuthExpiry(); return; }
+    /* Not handleAuthExpiry() on a 401 here - first-use has no session to
+     * expire, and a 401 on this specific request means the setup code was
+     * wrong or missing (bad_setup_secret), which belongs inline on this
+     * same screen, not a redirect to the login form. */
     if (setRes.ok) {
+      el('authSetupSecret').value = '';
       el('authNewPassword').value = '';
       el('authNewPasswordConfirm').value = '';
       showApp();
     } else {
       var errBody = await setRes.json().catch(function () { return {}; });
-      el('authSetPasswordHint').textContent = errBody.error === 'no_pending_salt'
-        ? 'Timed out - try again.'
+      el('authSetPasswordHint').textContent = errBody.error === 'no_pending_salt' ? 'Timed out - try again.'
+        : errBody.error === 'bad_setup_secret' ? 'Setup code is missing or incorrect - check the serial console.'
         : 'Could not set password.';
     }
   } catch (e) {
@@ -2112,7 +2122,10 @@ async function initAuth() {
       showApp();
       return;
     }
-    showAuthScreen(s.password_set ? 'login' : 'set-password');
+    showAuthScreen(s.password_set ? 'login' : 'set-password',
+      (!s.password_set && !s.onboarding_open)
+        ? 'The setup window has closed. Reopen it from the serial console with gwcfg-reopen-onboarding.'
+        : null);
   } catch (e) {
     showAuthScreen('login', 'Could not reach the node - check your connection and reload.');
   }

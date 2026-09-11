@@ -14,12 +14,14 @@
 #include "log_buffer.h"
 #include "provisioning.h"
 #include "task_stats.h"
+#include "tls_identity.h"
 #include "uplink_halow.h"
 #include "uplink_wifi.h"
 
 #include "cJSON.h"
 #include "esp_app_desc.h"
 #include "esp_http_server.h"
+#include "esp_https_server.h"
 #include "esp_log.h"
 #include "esp_ota_ops.h"
 #include "esp_system.h"
@@ -271,6 +273,17 @@ static bool auth_require_session(httpd_req_t *req)
     return true;
 }
 
+/* Applied to every credential/session/config response (review finding F02,
+ * design/PROJECT_REVIEW_2026-09-10.md) so neither the browser's own cache
+ * nor a shared/corporate proxy in front of it retains a copy - config
+ * responses never carry passphrases (see config_get_handler's own comment),
+ * but SSIDs, node identity and session-authenticated state have no business
+ * sitting in a cache either. Must be called before any httpd_resp_send*(). */
+static void set_no_store(httpd_req_t *req)
+{
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+}
+
 /* httpd_resp_send_err() always wraps its message in an HTML error page
  * (confirmed against esp_http_server.h) - fine for the plain-text guard
  * rejections above, wrong for anything the frontend needs to JSON.parse(),
@@ -299,6 +312,7 @@ static esp_err_t send_auth_json(httpd_req_t *req, const char *status, cJSON *bod
         return ESP_FAIL;
     }
     httpd_resp_set_type(req, "application/json");
+    set_no_store(req); /* every auth_*_handler funnels its response through here */
     esp_err_t err = httpd_resp_sendstr(req, out);
     free(out);
     return err;
@@ -321,8 +335,14 @@ static cJSON *make_auth_error(const char *error_code)
 static void set_session_cookie(httpd_req_t *req, char *cookie_buf, size_t cookie_buf_size,
                                 const char *token_hex)
 {
+    /* Secure added now that the transport is actually HTTPS (review finding
+     * F02, design/PROJECT_REVIEW_2026-09-10.md) - without it a browser will
+     * still send this cookie over a plain-HTTP connection if one existed,
+     * which none does here, but the attribute is what makes that a browser
+     * guarantee rather than just true by construction today. */
     snprintf(cookie_buf, cookie_buf_size,
-             "%s=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=43200", AUTH_COOKIE_NAME, token_hex);
+             "%s=%s; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=43200", AUTH_COOKIE_NAME,
+             token_hex);
     httpd_resp_set_hdr(req, "Set-Cookie", cookie_buf);
 }
 
@@ -412,6 +432,7 @@ static esp_err_t config_get_handler(httpd_req_t *req)
     }
 
     httpd_resp_set_type(req, "application/json");
+    set_no_store(req);
     esp_err_t err = httpd_resp_sendstr(req, out);
     free(out);
     return err;
@@ -615,6 +636,47 @@ static void copy_json_str(const cJSON *parent, const char *key, char *out, size_
     strlcpy(out, item->valuestring, out_size);
 }
 
+/* Copies a JSON numeric field into *out (only on success) if present.
+ * Missing means "keep the current value" - *out is left untouched and
+ * *bad_value is not set. Present-but-invalid (wrong type, fractional, or
+ * outside [min,max]) sets *bad_value and leaves *out untouched - callers
+ * must check this and reject the request, exactly like copy_json_str's
+ * too_long.
+ *
+ * Deliberately doesn't use cJSON's own valueint: it's computed as
+ * (int)valuedouble at parse time, and casting a double outside int's range
+ * to int is undefined behavior (C11 6.3.1.4) - and even where it isn't UB
+ * in practice, blindly narrowing an in-range-for-int-but-not-for-the-target
+ * value (e.g. valueint 262 cast to uint8_t by the caller) silently wraps to
+ * a small, legal-looking number instead of being rejected. Bounds are
+ * checked against valuedouble directly, before anything narrower ever casts
+ * it. Review finding F10, design/PROJECT_REVIEW_2026-09-10.md ("channel 262
+ * cast becomes 6 and accepted"). */
+static void copy_json_int_range(const cJSON *parent, const char *key, long min, long max, long *out,
+                                 bool *bad_value)
+{
+    *bad_value = false;
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(parent, key);
+    if (item == NULL) {
+        return;
+    }
+    if (!cJSON_IsNumber(item)) {
+        *bad_value = true;
+        return;
+    }
+    double v = item->valuedouble;
+    if (v < (double)min || v > (double)max) {
+        *bad_value = true;
+        return;
+    }
+    long iv = (long)v;
+    if ((double)iv != v) {
+        *bad_value = true; /* fractional, e.g. channel 6.5 */
+        return;
+    }
+    *out = iv;
+}
+
 static esp_err_t config_post_handler(httpd_req_t *req)
 {
     if (reject_if_remote(req) || reject_if_not_json(req) || auth_require_session(req)) {
@@ -669,6 +731,7 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     provisioning_config_unlock();
 
     bool too_long = false;
+    bool bad_value = false;
 
     copy_json_str(root, "node_id", work.node_id, sizeof(work.node_id), &too_long);
 
@@ -689,8 +752,9 @@ static esp_err_t config_post_handler(httpd_req_t *req)
             copy_json_str(uplink, "psk", work.uplink.psk, sizeof(work.uplink.psk), &too_long);
         }
         const cJSON *sec = cJSON_GetObjectItemCaseSensitive(uplink, "security");
-        if (cJSON_IsString(sec) && sec->valuestring != NULL) {
-            work.uplink.security = provisioning_parse_security(sec->valuestring);
+        if (cJSON_IsString(sec) && sec->valuestring != NULL &&
+            !provisioning_parse_security(sec->valuestring, &work.uplink.security)) {
+            bad_value = true;
         }
         const cJSON *use_static = cJSON_GetObjectItemCaseSensitive(uplink, "use_static_ip");
         if (cJSON_IsBool(use_static)) {
@@ -719,10 +783,11 @@ static esp_err_t config_post_handler(httpd_req_t *req)
         if (!too_long) {
             copy_json_str(softap, "psk", work.softap.psk, sizeof(work.softap.psk), &too_long);
         }
-        const cJSON *channel = cJSON_GetObjectItemCaseSensitive(softap, "channel");
-        if (cJSON_IsNumber(channel)) {
-            work.softap.channel = (uint8_t)channel->valueint;
-        }
+        long channel = work.softap.channel;
+        bool channel_bad;
+        copy_json_int_range(softap, "channel", 0, 255, &channel, &channel_bad);
+        bad_value = bad_value || channel_bad;
+        work.softap.channel = (uint8_t)channel;
     }
 
     const cJSON *wifi_uplink = cJSON_GetObjectItemCaseSensitive(root, "wifi_uplink");
@@ -740,21 +805,27 @@ static esp_err_t config_post_handler(httpd_req_t *req)
             copy_json_str(halow_ap, "psk", work.halow_ap.psk, sizeof(work.halow_ap.psk), &too_long);
         }
         const cJSON *ap_sec = cJSON_GetObjectItemCaseSensitive(halow_ap, "security");
-        if (cJSON_IsString(ap_sec) && ap_sec->valuestring != NULL) {
-            work.halow_ap.security = provisioning_parse_security(ap_sec->valuestring);
+        if (cJSON_IsString(ap_sec) && ap_sec->valuestring != NULL &&
+            !provisioning_parse_security(ap_sec->valuestring, &work.halow_ap.security)) {
+            bad_value = true;
         }
-        const cJSON *op_class = cJSON_GetObjectItemCaseSensitive(halow_ap, "op_class");
-        if (cJSON_IsNumber(op_class)) {
-            work.halow_ap.op_class = (int16_t)op_class->valueint;
-        }
-        const cJSON *chan_num = cJSON_GetObjectItemCaseSensitive(halow_ap, "s1g_chan_num");
-        if (cJSON_IsNumber(chan_num)) {
-            work.halow_ap.s1g_chan_num = (uint8_t)chan_num->valueint;
-        }
-        const cJSON *max_stas = cJSON_GetObjectItemCaseSensitive(halow_ap, "max_stas");
-        if (cJSON_IsNumber(max_stas)) {
-            work.halow_ap.max_stas = (uint8_t)max_stas->valueint;
-        }
+        long op_class = work.halow_ap.op_class;
+        bool op_class_bad;
+        copy_json_int_range(halow_ap, "op_class", INT16_MIN, INT16_MAX, &op_class, &op_class_bad);
+        bad_value = bad_value || op_class_bad;
+        work.halow_ap.op_class = (int16_t)op_class;
+
+        long chan_num = work.halow_ap.s1g_chan_num;
+        bool chan_num_bad;
+        copy_json_int_range(halow_ap, "s1g_chan_num", 0, 255, &chan_num, &chan_num_bad);
+        bad_value = bad_value || chan_num_bad;
+        work.halow_ap.s1g_chan_num = (uint8_t)chan_num;
+
+        long max_stas = work.halow_ap.max_stas;
+        bool max_stas_bad;
+        copy_json_int_range(halow_ap, "max_stas", 0, 255, &max_stas, &max_stas_bad);
+        bad_value = bad_value || max_stas_bad;
+        work.halow_ap.max_stas = (uint8_t)max_stas;
         if (!too_long) {
             copy_json_str(halow_ap, "ip", work.halow_ap.ip, sizeof(work.halow_ap.ip), &too_long);
         }
@@ -766,18 +837,22 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     const cJSON *cot = cJSON_GetObjectItemCaseSensitive(root, "cot");
     if (!too_long && cJSON_IsObject(cot)) {
         copy_json_str(cot, "group", work.cot.group, sizeof(work.cot.group), &too_long);
-        const cJSON *port = cJSON_GetObjectItemCaseSensitive(cot, "port");
-        if (cJSON_IsNumber(port)) {
-            work.cot.port = (port->valueint >= 0 && port->valueint <= 65535)
-                                ? (uint16_t)port->valueint
-                                : 0; /* out of range - provisioning_validate() rejects below */
-        }
+        long port = work.cot.port;
+        bool port_bad;
+        copy_json_int_range(cot, "port", 0, 65535, &port, &port_bad);
+        bad_value = bad_value || port_bad;
+        work.cot.port = (uint16_t)port;
     }
 
     cJSON_Delete(root);
 
     if (too_long) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "a field value is too long");
+        return ESP_FAIL;
+    }
+    if (bad_value) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                             "a field has an invalid type, value, or out-of-range number");
         return ESP_FAIL;
     }
 
@@ -1197,6 +1272,11 @@ static esp_err_t auth_status_get_handler(httpd_req_t *req)
     }
     cJSON_AddBoolToObject(root, "password_set", auth_password_is_set());
     cJSON_AddBoolToObject(root, "authenticated", authenticated);
+    /* Lets the first-use screen decide whether to ask for the setup code at
+     * all - onboarding can close (F03's boot-budget timeout) while
+     * password_set is still false, and the frontend has no other way to
+     * tell those two "no password yet" states apart. */
+    cJSON_AddBoolToObject(root, "onboarding_open", auth_onboarding_is_open());
     return send_auth_json(req, NULL, root);
 }
 
@@ -1265,7 +1345,7 @@ static esp_err_t auth_login_post_handler(httpd_req_t *req)
     uint32_t retry_after_s;
     switch (auth_verify_login(nonce_hex, response_hex, token_hex, &retry_after_s)) {
     case AUTH_LOGIN_OK: {
-        char cookie_buf[96];
+        char cookie_buf[128];
         set_session_cookie(req, cookie_buf, sizeof(cookie_buf), token_hex);
         cJSON *root = cJSON_CreateObject();
         if (root != NULL) {
@@ -1303,7 +1383,7 @@ static esp_err_t auth_logout_post_handler(httpd_req_t *req)
     }
 
     char cookie_buf[64];
-    snprintf(cookie_buf, sizeof(cookie_buf), "%s=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0",
+    snprintf(cookie_buf, sizeof(cookie_buf), "%s=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0",
              AUTH_COOKIE_NAME);
     httpd_resp_set_hdr(req, "Set-Cookie", cookie_buf);
 
@@ -1357,6 +1437,12 @@ static esp_err_t auth_password_post_handler(httpd_req_t *req)
 
     char stored_key_hex[AUTH_STORED_KEY_HEX_LEN + 1];
     bool ok = get_json_hex_field(body, "stored_key", stored_key_hex, AUTH_STORED_KEY_HEX_LEN);
+    /* Only meaningful (and only sent by the frontend) on the first-use claim
+     * path - absent here is normal for an authenticated change-password
+     * request, not an error; auth_commit_password() only checks it when no
+     * password exists yet. */
+    char setup_secret_hex[AUTH_SETUP_SECRET_HEX_LEN + 1];
+    bool secret_present = get_json_hex_field(body, "setup_secret", setup_secret_hex, AUTH_SETUP_SECRET_HEX_LEN);
     cJSON_Delete(body);
     if (!ok) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "stored_key must be present and correctly sized");
@@ -1364,9 +1450,9 @@ static esp_err_t auth_password_post_handler(httpd_req_t *req)
     }
 
     char token_hex[AUTH_TOKEN_HEX_LEN + 1];
-    switch (auth_commit_password(stored_key_hex, token_hex)) {
+    switch (auth_commit_password(stored_key_hex, secret_present ? setup_secret_hex : NULL, token_hex)) {
     case AUTH_SET_OK: {
-        char cookie_buf[96];
+        char cookie_buf[128];
         set_session_cookie(req, cookie_buf, sizeof(cookie_buf), token_hex);
         cJSON *root = cJSON_CreateObject();
         if (root != NULL) {
@@ -1379,6 +1465,8 @@ static esp_err_t auth_password_post_handler(httpd_req_t *req)
     case AUTH_SET_BAD_KEY:
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "stored_key is not valid hex");
         return ESP_FAIL;
+    case AUTH_SET_BAD_SETUP_SECRET:
+        return send_auth_json(req, "401 Unauthorized", make_auth_error("bad_setup_secret"));
     case AUTH_SET_SAVE_FAILED:
     default:
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to save credential");
@@ -1398,29 +1486,71 @@ esp_err_t web_ui_start(gw_config_t *cfg, esp_netif_t *softap_netif)
         ESP_LOGE(TAG, "no SoftAP netif - refusing to start an unreachable web UI");
         return ESP_ERR_INVALID_ARG;
     }
+    if (!auth_is_ready()) {
+        /* auth_init() failed (e.g. mutex allocation) - every functional
+         * handler below calls auth_require_session(), which calls straight
+         * into auth.c's session/lockout functions. Those take s_auth_lock
+         * unconditionally; with no lock that's a NULL FreeRTOS semaphore
+         * handle, which asserts rather than just misbehaving (same class of
+         * bug as cot_relay_get_counters() - review finding F01). Refusing to
+         * start is "fail closed" for a management interface that can't prove
+         * it can gate itself, per the review's "safe auth-init failure" item,
+         * design/PROJECT_REVIEW_2026-09-10.md. */
+        ESP_LOGE(TAG, "auth subsystem not initialized - refusing to start the web UI rather than "
+                      "serve it unauthenticated or crash on first login attempt");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!tls_identity_is_ready()) {
+        /* Same "fail closed" reasoning as the auth check above: no
+         * certificate means httpd_ssl_start() has nothing to serve HTTPS
+         * with. tls_identity_init() runs at boot before this function is
+         * ever called (main/app_main.c) and only fails this way on a real
+         * error (allocation, mbedtls) - not on first boot, which generates
+         * one instead of finding it missing. */
+        ESP_LOGE(TAG, "no HTTPS identity available - refusing to start the web UI");
+        return ESP_ERR_INVALID_STATE;
+    }
 
     s_cfg = cfg;
     s_softap_netif = softap_netif;
 
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.lru_purge_enable = true;
+    httpd_ssl_config_t config = HTTPD_SSL_CONFIG_DEFAULT();
+    config.httpd.lru_purge_enable = true;
     /* The scan handler blocks for up to WEB_UI_SCAN_TIMEOUT_MS; the default
      * 5s socket timeouts would abort the connection before it can answer. */
-    config.recv_wait_timeout = 15;
-    config.send_wait_timeout = 15;
+    config.httpd.recv_wait_timeout = 15;
+    config.httpd.send_wait_timeout = 15;
     /* Default is 8 and there are 16 routes below - raised so adding one
      * doesn't fail registration at runtime instead of at compile time. */
-    config.max_uri_handlers = 18;
+    config.httpd.max_uri_handlers = 18;
     /* The status and scan handlers build and print whole cJSON trees on this
-     * stack, on top of the default 4KB. (Scan *results* are delivered from the
-     * driver's own task - see uplink_halow.h - but assembling and serializing
-     * the response happens here.) */
-    config.stack_size = GW_STACK_WEB_UI;
+     * stack, on top of the TLS handshake state a plain-HTTP budget never had
+     * to carry - see GW_STACK_WEB_UI's own comment (task_stats.h). (Scan
+     * *results* are delivered from the driver's own task - see
+     * uplink_halow.h - but assembling and serializing the response happens
+     * here.) */
+    config.httpd.stack_size = GW_STACK_WEB_UI;
+    /* max_open_sockets is left at HTTPD_SSL_CONFIG_DEFAULT()'s own reduced
+     * default (4, not plain httpd's 7) deliberately - see
+     * sdkconfig.defaults' CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC comment for the
+     * ~40KB-per-TLS-socket reasoning behind that default. */
+
+    size_t cert_len = 0, key_len = 0;
+    const uint8_t *cert_der = tls_identity_get_cert_der(&cert_len);
+    const uint8_t *key_der = tls_identity_get_key_der(&key_len);
+    /* Both fields accept DER despite the "_pem" naming - mbedtls's own
+     * parsers auto-detect the format (see gw_tls_identity_t's own comment,
+     * main/gw_config.h). */
+    config.servercert = cert_der;
+    config.servercert_len = cert_len;
+    config.prvtkey_pem = key_der;
+    config.prvtkey_len = key_len;
+    config.transport_mode = HTTPD_SSL_TRANSPORT_SECURE;
 
     httpd_handle_t server = NULL;
-    esp_err_t err = httpd_start(&server, &config);
+    esp_err_t err = httpd_ssl_start(&server, &config);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "httpd_start failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "httpd_ssl_start failed: %s", esp_err_to_name(err));
         return err;
     }
 
@@ -1452,6 +1582,6 @@ esp_err_t web_ui_start(gw_config_t *cfg, esp_netif_t *softap_netif)
         }
     }
 
-    ESP_LOGI(TAG, "web UI started (SoftAP clients only)");
+    ESP_LOGI(TAG, "web UI started over HTTPS (SoftAP clients only, port %d)", config.port_secure);
     return ESP_OK;
 }

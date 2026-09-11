@@ -60,7 +60,24 @@ extern "C" {
  * comes back with static_dns empty - the same "no DNS configured" state a
  * static-IP uplink has always silently had, just now a real field instead
  * of an unreachable one. */
-#define GW_CONFIG_VERSION 7u
+/* v8: adds `tls` (gw_tls_identity_t) - the web UI's per-device HTTPS
+ * identity (review finding F02, design/PROJECT_REVIEW_2026-09-10.md). A v7
+ * blob is discarded (grown struct) rather than migrated; it comes back with
+ * `tls.identity_set == false`, which is exactly the "generate one at next
+ * boot" state tls_identity_init() already treats as normal - no migration
+ * code needed, same reasoning v6's auth field addition used. */
+/* v9: adds `gw_auth_config_t.onboarding_ever_started`/`onboarding_open`/
+ * `setup_secret`/`onboarding_boots_remaining` - the first-ownership claim
+ * window (review finding F03, design/PROJECT_REVIEW_2026-09-10.md). A v8
+ * blob is discarded rather than migrated; it comes back with
+ * `onboarding_ever_started == false`, which correctly reopens a fresh
+ * onboarding window on next boot for a device whose config was just reset
+ * to defaults by the version mismatch itself - the review's own "an
+ * invalid/migrated configuration does not silently reopen public onboarding"
+ * concern is about a corrupt blob resuming with *no* gate, not about a
+ * legitimately-reset device getting a fresh, gated window - same "no
+ * migration code needed" reasoning v6 and v8 already used. */
+#define GW_CONFIG_VERSION 9u
 
 /* Which pair of radio roles this node runs. Selects the entire bring-up path
  * in app_main.c - the two are mutually exclusive because both would-be uses
@@ -253,6 +270,38 @@ typedef struct {
     uint16_t port;                  /* e.g. 6969 */
 } gw_cot_config_t;
 
+/* Per-device HTTPS identity for the web UI (review finding F02,
+ * design/PROJECT_REVIEW_2026-09-10.md). No CA can issue a certificate for a
+ * private IP, so this is a self-signed ECDSA P-256 keypair/certificate
+ * generated on-device at first boot (main/tls_identity.c) - trust is
+ * established the way SSH host keys are: the operator reads the
+ * certificate's fingerprint off the serial console (gwcfg-show-cert) once
+ * and compares it against what their browser shows before accepting the
+ * warning, not by chasing a CA.
+ *
+ * Stored as DER, not PEM: mbedtls_x509_crt_parse()/mbedtls_pk_parse_key()
+ * both auto-detect DER vs PEM by scanning for a "-----BEGIN" header
+ * (esp-idf v5.5.1 mbedtls/library/x509_crt.c L1414-1421) and fall straight
+ * through to the DER parser when it's absent - confirmed against that
+ * source before relying on it - so there is no need to spend flash on the
+ * PEM-write code path or NVS space on base64/armor overhead. Buffer sizes
+ * are generous, not tight: a P-256 SEC1 private key is ~121-138 bytes and a
+ * minimal self-signed cert with this shape (short CN, P-256 key + ECDSA-
+ * SHA256 signature, one basic-constraints extension) is ~350-450 bytes;
+ * tls_identity_init() checks the real mbedtls-reported length against these
+ * bounds rather than assuming they hold. */
+typedef struct {
+    bool identity_set; /* same pattern as gw_auth_config_t.password_set - an
+                         * all-zero buffer is not a valid cert/key, but the
+                         * explicit flag is what says "never generated" vs.
+                         * "somehow zero-length", same reasoning as that
+                         * field's own comment. */
+    uint16_t key_der_len;
+    uint8_t key_der[256];
+    uint16_t cert_der_len;
+    uint8_t cert_der[700];
+} gw_tls_identity_t;
+
 /* An admin credential for the web UI (design/ROADMAP.md item 1). Never the
  * plaintext password - stored_key is PBKDF2-HMAC-SHA256(password, salt,
  * iterations, 32), computed client-side in web_ui.html's bundled crypto.
@@ -272,6 +321,38 @@ typedef struct {
                               * default proves too slow on real phones) the constant
                               * later doesn't strand already-provisioned devices */
     uint8_t stored_key[32]; /* PBKDF2-HMAC-SHA256 output - see this struct's own comment */
+
+    /* First-ownership onboarding window (review finding F03,
+     * design/PROJECT_REVIEW_2026-09-10.md). A shared default SoftAP
+     * passphrase means anyone in radio range who knows it (every unit ships
+     * with the same one) could otherwise claim the admin account before the
+     * legitimate owner does - forced password setup stops a universal admin
+     * password but does nothing to establish *who* gets to set it first.
+     * Before `password_set`, claiming also requires presenting
+     * `setup_secret` - read off the serial console
+     * (`gwcfg-show-setup-secret`, and logged once at boot), the same
+     * physical-presence trust model `tls_identity.c`'s certificate
+     * fingerprint already uses.
+     *
+     * `onboarding_ever_started` and `onboarding_open` are two separate
+     * bools, not one, because "never opened yet" (fresh/reset device) and
+     * "opened, then closed by running out of boots" must be
+     * distinguishable: both leave `onboarding_open == false`, but only the
+     * first should cause auth_init() to open a fresh window. Collapsing
+     * them into one flag would either reopen a timed-out window on every
+     * boot (defeating the timeout) or fail to ever open one on a
+     * legitimately fresh device - see auth_init()'s own comment (main/auth.c)
+     * for the exact state machine. */
+    bool onboarding_ever_started;
+    bool onboarding_open;
+    uint8_t setup_secret[16]; /* esp_fill_random(), regenerated whenever onboarding (re)opens */
+    /* Decremented once per boot while onboarding_open - closes the window
+     * after a bounded number of boots rather than a wall-clock timeout,
+     * because this board has no RTC battery (same reasoning
+     * tls_identity.c's fixed certificate validity window already uses): a
+     * boot-relative timer can't measure elapsed time across a power cycle,
+     * but a persisted boot count can, with no clock dependency at all. */
+    uint16_t onboarding_boots_remaining;
 } gw_auth_config_t;
 
 typedef struct {
@@ -305,6 +386,7 @@ typedef struct {
     gw_halow_ap_config_t halow_ap;         /* GW_ROLE_RELAY: HaLow AP downlink */
     gw_cot_config_t cot;
     gw_auth_config_t auth;                 /* web UI admin credential - see its own comment */
+    gw_tls_identity_t tls;                 /* web UI HTTPS identity - see its own comment */
 } gw_config_t;
 
 #ifdef __cplusplus

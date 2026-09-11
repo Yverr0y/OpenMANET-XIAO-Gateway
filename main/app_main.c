@@ -28,6 +28,7 @@
 #include "provisioning.h"
 #include "status_led.h"
 #include "task_stats.h"
+#include "tls_identity.h"
 #include "uplink_halow.h"
 #include "uplink_wifi.h"
 #include "web_ui.h"
@@ -613,6 +614,16 @@ void app_main(void)
     err = auth_init(&s_cfg);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "auth init failed: %s", esp_err_to_name(err));
+    }
+
+    /* Also after provisioning_load(), same ordering reason as auth_init()
+     * above - generates the device's self-signed HTTPS identity on first
+     * boot (or loads the existing one) and logs its fingerprint, so it's
+     * available before web_ui_start() ever needs it. Review finding F02,
+     * design/PROJECT_REVIEW_2026-09-10.md. */
+    err = tls_identity_init(&s_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "TLS identity init failed: %s", esp_err_to_name(err));
     }
 
     ESP_ERROR_CHECK(esp_netif_init());

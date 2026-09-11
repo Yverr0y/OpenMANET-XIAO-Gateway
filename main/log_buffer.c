@@ -1,5 +1,4 @@
 #include <stdarg.h>
-#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -20,7 +19,15 @@
 
 static char s_ring[LOG_RING_SIZE];
 static size_t s_head = 0;  /* next write position */
-static bool s_wrapped = false;
+/* Valid byte count, capped at LOG_RING_SIZE once the ring is full. Not a
+ * "did we ever wrap" bool: appends land at s_head in LOG_LINE_MAX-sized
+ * (<=256B) chunks, so a run of writes can bring s_head back to exactly 0
+ * (a full lap) without any single append straddling the end - the case a
+ * wrap-detecting bool misses. Confirmed with 24 writes of 256 bytes
+ * (24*256 == LOG_RING_SIZE): s_head lands on 0, no append ever crossed the
+ * boundary, so a bool never flips and a completely full ring reads back as
+ * empty. Review finding F17, design/PROJECT_REVIEW_2026-09-10.md. */
+static size_t s_count = 0;
 static SemaphoreHandle_t s_lock = NULL;
 static vprintf_like_t s_next = NULL;
 
@@ -54,9 +61,9 @@ static void ring_append(const char *data, size_t len)
     memcpy(s_ring + s_head, data, first);
     if (len > first) {
         memcpy(s_ring, data + first, len - first);
-        s_wrapped = true;
     }
     s_head = (s_head + len) % LOG_RING_SIZE;
+    s_count = (s_count + len > LOG_RING_SIZE) ? LOG_RING_SIZE : s_count + len;
 }
 
 static int log_vprintf(const char *fmt, va_list args)
@@ -123,8 +130,8 @@ size_t log_buffer_read(char *out, size_t out_size)
         return 0;
     }
 
-    size_t available = s_wrapped ? LOG_RING_SIZE : s_head;
-    size_t start = s_wrapped ? s_head : 0; /* oldest byte */
+    size_t available = s_count;
+    size_t start = (s_count == LOG_RING_SIZE) ? s_head : 0; /* oldest byte */
 
     /* Drop the oldest if the caller's buffer is smaller than what we hold. */
     if (available > out_size - 1) {

@@ -35,6 +35,15 @@ static const char *TAG = "auth";
  * count is what login actually verifies against. */
 #define AUTH_PBKDF2_ITERATIONS 100000
 
+/* How many boots the first-ownership onboarding window survives before it
+ * closes on its own (review finding F03, design/PROJECT_REVIEW_2026-09-10.md;
+ * see gw_auth_config_t's own comment, main/gw_config.h, for why this is a
+ * boot count rather than a wall-clock timeout). Generous enough to cover a
+ * real unboxing-to-claimed session with a couple of reboots for
+ * troubleshooting along the way, still clearly bounded rather than
+ * open-ended. */
+#define AUTH_ONBOARDING_BOOT_BUDGET 10
+
 typedef struct {
     bool in_use;
     char token_hex[AUTH_TOKEN_HEX_LEN + 1];
@@ -162,7 +171,71 @@ esp_err_t auth_init(gw_config_t *cfg)
     if (s_auth_lock == NULL) {
         return ESP_ERR_NO_MEM;
     }
+
+    /* Onboarding window state machine (review finding F03,
+     * design/PROJECT_REVIEW_2026-09-10.md; see gw_auth_config_t's own
+     * comment, main/gw_config.h). Deliberately mutates *cfg in place - a
+     * static global (app_main.c's s_cfg), not a stack copy - rather than
+     * following auth_commit_password()'s scratch-copy-then-save discipline:
+     * that pattern needs a full gw_config_t local (now well over a KB with
+     * the tls/auth fields this project has added), and this function runs
+     * on FreeRTOS's default "main" task at boot - the same
+     * ~3584-byte CONFIG_ESP_MAIN_TASK_STACK_SIZE budget a gw_config_t-sized
+     * local overflowed once already this session (see
+     * GW_STACK_TLS_IDENTITY_GEN's own comment, task_stats.h). The state
+     * here is boot-count bookkeeping, not a credential a failed write could
+     * leave inconsistent in a way that matters - worst case on a failed
+     * save is the next boot re-derives the same decision.
+     *
+     * Three states, distinguished exactly as gw_auth_config_t's own comment
+     * describes:
+     *   - never started (fresh/reset device): open a window.
+     *   - started and still open: spend one boot of the budget, closing it
+     *     if that was the last one.
+     *   - started and already closed: do nothing - a plain reboot must not
+     *     reopen it (review acceptance criterion), only
+     *     auth_reopen_onboarding() (gwcfg-reopen-onboarding) may. */
+    if (!cfg->auth.password_set) {
+        provisioning_config_lock();
+        bool changed = false;
+        if (!cfg->auth.onboarding_ever_started) {
+            esp_fill_random(cfg->auth.setup_secret, sizeof(cfg->auth.setup_secret));
+            cfg->auth.onboarding_ever_started = true;
+            cfg->auth.onboarding_open = true;
+            cfg->auth.onboarding_boots_remaining = AUTH_ONBOARDING_BOOT_BUDGET;
+            changed = true;
+        } else if (cfg->auth.onboarding_open) {
+            if (cfg->auth.onboarding_boots_remaining > 0) {
+                cfg->auth.onboarding_boots_remaining--;
+            }
+            if (cfg->auth.onboarding_boots_remaining == 0) {
+                cfg->auth.onboarding_open = false;
+            }
+            changed = true;
+        }
+        esp_err_t save_err = changed ? provisioning_save(cfg) : ESP_OK;
+        bool open_now = cfg->auth.onboarding_open;
+        provisioning_config_unlock();
+
+        if (save_err != ESP_OK) {
+            ESP_LOGW(TAG, "failed to persist onboarding window state: %s", esp_err_to_name(save_err));
+        }
+        if (open_now) {
+            char secret_hex[AUTH_SETUP_SECRET_HEX_LEN + 1];
+            if (auth_get_setup_secret_hex(secret_hex, sizeof(secret_hex))) {
+                ESP_LOGI(TAG, "onboarding open - device setup code: %s", secret_hex);
+                ESP_LOGI(TAG, "present this to claim admin ownership - also available any time via "
+                              "'gwcfg-show-setup-secret' while onboarding stays open");
+            }
+        }
+    }
+
     return ESP_OK;
+}
+
+bool auth_is_ready(void)
+{
+    return s_auth_lock != NULL;
 }
 
 bool auth_password_is_set(void)
@@ -333,8 +406,33 @@ void auth_begin_password_salt(char *salt_hex_out, uint32_t *iterations_out)
     xSemaphoreGive(s_auth_lock);
 }
 
-auth_set_password_result_t auth_commit_password(const char *stored_key_hex, char *token_hex_out)
+auth_set_password_result_t auth_commit_password(const char *stored_key_hex, const char *setup_secret_hex,
+                                                  char *token_hex_out)
 {
+    /* First-ownership claim (review finding F03,
+     * design/PROJECT_REVIEW_2026-09-10.md) checked *before* the pending
+     * salt offer below is touched at all, deliberately - confirmed on real
+     * hardware why order matters here: an earlier version checked this
+     * after marking the salt consumed, so a single wrong-setup-secret
+     * attempt burned the one-time salt offer and made the *next* attempt -
+     * even with the correct secret - fail with AUTH_SET_NO_PENDING_SALT
+     * instead. A locked-out operator with the right code in hand should
+     * never see that. */
+    if (!auth_password_is_set()) {
+        provisioning_config_lock();
+        uint8_t expected[sizeof(s_cfg->auth.setup_secret)];
+        memcpy(expected, s_cfg->auth.setup_secret, sizeof(expected));
+        bool open = s_cfg->auth.onboarding_open;
+        provisioning_config_unlock();
+
+        uint8_t given[sizeof(expected)];
+        bool secret_ok = open && hex_to_bytes(setup_secret_hex, given, sizeof(given)) &&
+                          constant_time_equal(expected, given, sizeof(expected));
+        if (!secret_ok) {
+            return AUTH_SET_BAD_SETUP_SECRET;
+        }
+    }
+
     xSemaphoreTake(s_auth_lock, portMAX_DELAY);
     int64_t now = esp_timer_get_time();
     bool salt_ok = s_pending_salt.active && (now - s_pending_salt.issued_us) < AUTH_SALT_OFFER_TTL_US;
@@ -365,10 +463,20 @@ auth_set_password_result_t auth_commit_password(const char *stored_key_hex, char
     gw_config_t work;
     provisioning_config_lock();
     memcpy(&work, s_cfg, sizeof(work));
+
     memcpy(work.auth.salt, salt_copy, sizeof(work.auth.salt));
     work.auth.iterations = iterations_copy;
     memcpy(work.auth.stored_key, stored_key, sizeof(work.auth.stored_key));
     work.auth.password_set = true;
+    /* Real ownership is established now - close onboarding for good and
+     * drop the secret rather than leave it sitting unused in NVS. A plain
+     * reboot must not reopen it (same acceptance criterion auth_init()'s
+     * own comment cites); only a factory reset (which wipes password_set
+     * too, reopening a fresh window on next boot - see gw_config.h's v9
+     * comment) or gwcfg-reopen-onboarding can, and the latter refuses once
+     * password_set is true (auth_reopen_onboarding()'s own comment). */
+    work.auth.onboarding_open = false;
+    memset(work.auth.setup_secret, 0, sizeof(work.auth.setup_secret));
 
     esp_err_t err = provisioning_save(&work);
     if (err == ESP_OK) {
@@ -397,4 +505,54 @@ void auth_drop_all_sessions(void)
     xSemaphoreTake(s_auth_lock, portMAX_DELAY);
     memset(s_sessions, 0, sizeof(s_sessions));
     xSemaphoreGive(s_auth_lock);
+}
+
+bool auth_onboarding_is_open(void)
+{
+    provisioning_config_lock();
+    bool open = !s_cfg->auth.password_set && s_cfg->auth.onboarding_open;
+    provisioning_config_unlock();
+    return open;
+}
+
+bool auth_get_setup_secret_hex(char *out, size_t out_size)
+{
+    if (out == NULL || out_size < AUTH_SETUP_SECRET_HEX_LEN + 1) {
+        return false;
+    }
+    provisioning_config_lock();
+    bool open = !s_cfg->auth.password_set && s_cfg->auth.onboarding_open;
+    uint8_t secret[sizeof(s_cfg->auth.setup_secret)];
+    memcpy(secret, s_cfg->auth.setup_secret, sizeof(secret));
+    provisioning_config_unlock();
+
+    if (!open) {
+        return false;
+    }
+    bytes_to_hex(secret, sizeof(secret), out);
+    return true;
+}
+
+esp_err_t auth_reopen_onboarding(void)
+{
+    provisioning_config_lock();
+    if (s_cfg->auth.password_set) {
+        provisioning_config_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Same "mutate the global in place, no gw_config_t-sized stack local"
+     * reasoning as auth_init() - this is reachable from the console task
+     * (provisioning.c's REPL, 4096 bytes), which is more headroom than the
+     * boot-time "main" task ever had, but there's no reason to reintroduce
+     * the pattern that already caused one crash this session just because
+     * this particular caller happens to have more room. */
+    esp_fill_random(s_cfg->auth.setup_secret, sizeof(s_cfg->auth.setup_secret));
+    s_cfg->auth.onboarding_ever_started = true;
+    s_cfg->auth.onboarding_open = true;
+    s_cfg->auth.onboarding_boots_remaining = AUTH_ONBOARDING_BOOT_BUDGET;
+
+    esp_err_t err = provisioning_save(s_cfg);
+    provisioning_config_unlock();
+    return err;
 }

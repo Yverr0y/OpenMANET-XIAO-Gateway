@@ -18,6 +18,7 @@ idf_component_register(
         "auth.c"
         "dns_forward.c"
         "heap_guard.c"
+        "tls_identity.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_wifi
@@ -27,6 +28,7 @@ idf_component_register(
         console
         lwip
         esp_http_server
+        esp_https_server
         esp_timer
         esp_app_format
         app_update

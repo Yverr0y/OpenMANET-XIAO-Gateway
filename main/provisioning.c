@@ -20,6 +20,7 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "task_stats.h"
+#include "tls_identity.h"
 #include "uplink_halow.h"
 #include "uplink_wifi.h"
 
@@ -242,6 +243,97 @@ esp_err_t provisioning_save(const gw_config_t *cfg)
     return err;
 }
 
+/* Validates one IPv4 host+netmask(+gateway) triple as actually usable, not
+ * merely parseable - inet_aton() succeeding says nothing about a
+ * non-contiguous mask, an IP that's really the network/broadcast address of
+ * its own subnet, or a gateway that isn't reachable on it. `what` names the
+ * field group in rejection messages (e.g. "local Wi-Fi"). `gateway_str` may
+ * be NULL for a subnet with no gateway concept (the HaLow AP's own downlink
+ * address - leaves point directly at it). On success, *ip_h_out and
+ * *mask_h_out (host byte order) let the caller check two subnets against
+ * each other - see subnets_overlap() below. Review finding F10,
+ * design/PROJECT_REVIEW_2026-09-10.md. */
+static esp_err_t validate_host_subnet(const char *what, const char *ip_str, const char *netmask_str,
+                                       const char *gateway_str, uint32_t *ip_h_out, uint32_t *mask_h_out,
+                                       char *errbuf, size_t errbuf_len)
+{
+#define GW_SUBNET_REJECT(...)                                \
+    do {                                                     \
+        if (errbuf != NULL && errbuf_len > 0) {               \
+            snprintf(errbuf, errbuf_len, __VA_ARGS__);        \
+        }                                                     \
+        return ESP_ERR_INVALID_ARG;                           \
+    } while (0)
+
+    struct in_addr ip, mask;
+    if (inet_aton(ip_str, &ip) == 0) {
+        GW_SUBNET_REJECT("%s IP '%s' is not a valid address", what, ip_str);
+    }
+    if (inet_aton(netmask_str, &mask) == 0) {
+        GW_SUBNET_REJECT("%s netmask '%s' is not a valid address", what, netmask_str);
+    }
+
+    uint32_t mask_h = ntohl(mask.s_addr);
+    if (mask_h == 0) {
+        GW_SUBNET_REJECT("%s netmask '%s' must not be all-zero", what, netmask_str);
+    }
+    /* A valid netmask is some number of leading 1 bits followed by trailing 0
+     * bits. Inverted, that's trailing 1 bits with nothing above them - which
+     * is exactly the values of the form 2^n - 1 (including 0, /32's case).
+     * `inv & (inv + 1)` is zero only for such values: incrementing a run of
+     * trailing 1s carries all the way through it, so the AND has nothing left
+     * in common; any 1 bit sitting above a 0 (the non-contiguous case) survives
+     * the AND untouched. */
+    uint32_t inverted_mask = ~mask_h;
+    if ((inverted_mask & (inverted_mask + 1)) != 0) {
+        GW_SUBNET_REJECT("%s netmask '%s' is not contiguous", what, netmask_str);
+    }
+
+    uint32_t ip_h = ntohl(ip.s_addr);
+    uint32_t host_mask = ~mask_h;
+    uint32_t host_bits = ip_h & host_mask;
+    if (host_bits == 0) {
+        GW_SUBNET_REJECT("%s IP '%s' is the network address of its own subnet, not a usable host",
+                          what, ip_str);
+    }
+    if (host_bits == host_mask) {
+        GW_SUBNET_REJECT("%s IP '%s' is the broadcast address of its own subnet, not a usable host",
+                          what, ip_str);
+    }
+
+    if (gateway_str != NULL) {
+        struct in_addr gw;
+        if (inet_aton(gateway_str, &gw) == 0 || gw.s_addr == 0) {
+            GW_SUBNET_REJECT("%s gateway '%s' must be a valid, non-zero address", what, gateway_str);
+        }
+        uint32_t gw_h = ntohl(gw.s_addr);
+        if ((gw_h & mask_h) != (ip_h & mask_h)) {
+            GW_SUBNET_REJECT("%s gateway '%s' is not in the same subnet as %s", what, gateway_str, ip_str);
+        }
+    }
+
+    if (ip_h_out != NULL) {
+        *ip_h_out = ip_h;
+    }
+    if (mask_h_out != NULL) {
+        *mask_h_out = mask_h;
+    }
+    return ESP_OK;
+
+#undef GW_SUBNET_REJECT
+}
+
+/* True if the two (network, mask) pairs describe overlapping address ranges -
+ * either network address falling inside the other's range, checked both ways
+ * since neither mask is assumed to be the more specific one. Both inputs are
+ * assumed already-validated (contiguous, non-zero) subnets. */
+static bool subnets_overlap(uint32_t ip_a_h, uint32_t mask_a_h, uint32_t ip_b_h, uint32_t mask_b_h)
+{
+    uint32_t net_a = ip_a_h & mask_a_h;
+    uint32_t net_b = ip_b_h & mask_b_h;
+    return ((net_a & mask_b_h) == net_b) || ((net_b & mask_a_h) == net_a);
+}
+
 /* Rejects configs that would brick the device's own management path or that
  * esp_wifi/lwIP would refuse at bring-up. Shared by the console, the web UI,
  * and the NVS load path so all three agree on what "valid" means. On failure
@@ -279,39 +371,35 @@ esp_err_t provisioning_validate(const gw_config_t *cfg, char *errbuf, size_t err
      * node's current role, same reasoning as the rest of this function:
      * one validator, shared by console/web UI/NVS load, that doesn't need
      * to know which fields the active role actually reads. */
+    /* Tracked across the two subnet blocks below so the client role's static
+     * uplink (when set) can be checked against its own SoftAP subnet for
+     * overlap - two different physical netifs assigned the same address
+     * range breaks NAT/routing between them in a way parsing alone can't
+     * catch. Only meaningful once both are known valid. */
+    uint32_t uplink_ip_h = 0, uplink_mask_h = 0;
+    bool have_uplink_subnet = false;
+
     if (cfg->uplink.use_static_ip) {
-        /* Parsing is necessary but not sufficient, and each of these three
-         * fails differently and silently if left at zero:
-         *
-         *  - a zero address or netmask makes esp_netif_is_valid_static_ip()
-         *    false, so esp_netif_action_connected() logs a bare "invalid
-         *    static ip" from inside esp_netif and never posts
-         *    IP_EVENT_STA_GOT_IP. The node associates and then sits at
-         *    "associated, no lease" forever with nothing naming the cause.
-         *  - a zero gateway parses and applies fine, and then nothing routes
-         *    off this subnet: ip_forward_nat_init() makes the uplink the
-         *    default netif, so every NAT'd client packet heads for a gateway
-         *    that isn't there.
-         *
-         * inet_aton() accepts "0.0.0.0" for all three, so reject them here -
-         * in front of the operator, who is looking at this error text - rather
-         * than three layers down at a moment nobody is watching. */
-        struct in_addr addr;
-        if (inet_aton(cfg->uplink.static_ip, &addr) == 0 || addr.s_addr == 0) {
-            GW_REJECT("uplink static IP '%s' must be a valid, non-zero address",
-                      cfg->uplink.static_ip);
+        /* Parsing is necessary but not sufficient - a zero address/netmask
+         * makes esp_netif_is_valid_static_ip() false (associates, then sits
+         * at "no lease" forever with nothing naming the cause), a
+         * non-contiguous mask or a network/broadcast-address IP misconfigures
+         * the subnet in ways that fail just as silently, and a gateway
+         * outside the resulting subnet means ip_forward_nat_init() makes the
+         * uplink the default route to nowhere - see
+         * validate_host_subnet()'s own comment. */
+        esp_err_t sub_err = validate_host_subnet("uplink static", cfg->uplink.static_ip,
+                                                   cfg->uplink.static_netmask, cfg->uplink.static_gateway,
+                                                   &uplink_ip_h, &uplink_mask_h, errbuf, errbuf_len);
+        if (sub_err != ESP_OK) {
+            return sub_err;
         }
-        if (inet_aton(cfg->uplink.static_gateway, &addr) == 0 || addr.s_addr == 0) {
-            GW_REJECT("uplink static gateway '%s' must be a valid, non-zero address",
-                      cfg->uplink.static_gateway);
-        }
-        if (inet_aton(cfg->uplink.static_netmask, &addr) == 0 || addr.s_addr == 0) {
-            GW_REJECT("uplink static netmask '%s' must be a valid, non-zero address",
-                      cfg->uplink.static_netmask);
-        }
-        /* Unlike the three above, empty is valid here - it means "no DNS
+        have_uplink_subnet = true;
+
+        /* Unlike the fields above, empty is valid here - it means "no DNS
          * configured", the same state this field has always defaulted to.
          * Only reject a value that was actually supplied but isn't usable. */
+        struct in_addr addr;
         if (cfg->uplink.static_dns[0] != '\0' &&
             (inet_aton(cfg->uplink.static_dns, &addr) == 0 || addr.s_addr == 0)) {
             GW_REJECT("uplink static DNS '%s' must be empty or a valid, non-zero address",
@@ -340,17 +428,34 @@ esp_err_t provisioning_validate(const gw_config_t *cfg, char *errbuf, size_t err
         GW_REJECT("max_connections must be 15 or fewer");
     }
 
+    /* Effective SoftAP subnet either way - esp_netif's own compiled-in
+     * default (192.168.4.1/255.255.255.0, _g_esp_netif_soft_ap_ip in
+     * esp-idf v5.5.1's esp_netif_defaults.c) when no custom one is set, so
+     * the overlap check below always has a real subnet to compare against,
+     * not just the custom-subnet case. */
+    uint32_t softap_ip_h, softap_mask_h;
     if (cfg->softap.use_custom_subnet) {
-        struct in_addr tmp;
-        if (inet_aton(cfg->softap.ip, &tmp) == 0) {
-            GW_REJECT("local Wi-Fi IP '%s' is not a valid address", cfg->softap.ip);
+        esp_err_t sub_err = validate_host_subnet("local Wi-Fi", cfg->softap.ip, cfg->softap.netmask,
+                                                   cfg->softap.gateway, &softap_ip_h, &softap_mask_h, errbuf,
+                                                   errbuf_len);
+        if (sub_err != ESP_OK) {
+            return sub_err;
         }
-        if (inet_aton(cfg->softap.gateway, &tmp) == 0) {
-            GW_REJECT("local Wi-Fi gateway '%s' is not a valid address", cfg->softap.gateway);
-        }
-        if (inet_aton(cfg->softap.netmask, &tmp) == 0) {
-            GW_REJECT("local Wi-Fi netmask '%s' is not a valid address", cfg->softap.netmask);
-        }
+    } else {
+        softap_ip_h = ((uint32_t)192 << 24) | (168u << 16) | (4u << 8) | 1u;
+        softap_mask_h = 0xFFFFFF00u;
+    }
+
+    /* Two different physical netifs (the SoftAP and a statically-addressed
+     * uplink) assigned overlapping ranges silently breaks NAT/routing
+     * between them - not a parse error either field would catch alone.
+     * Only checkable for the client role's own uplink; wifi_uplink (relay
+     * role) is DHCP-only and its subnet isn't known at validate time, and
+     * halow_ap never coexists with a SoftAP on the same node (mutually
+     * exclusive roles) - see gw_config.h's gw_node_role_t. */
+    if (have_uplink_subnet && subnets_overlap(uplink_ip_h, uplink_mask_h, softap_ip_h, softap_mask_h)) {
+        GW_REJECT("uplink static IP '%s' and the local Wi-Fi subnet overlap - NAT needs them distinct",
+                  cfg->uplink.static_ip);
     }
 
     /* GW_ROLE_RELAY fields. Same "empty means not configured yet" pattern as
@@ -388,12 +493,13 @@ esp_err_t provisioning_validate(const gw_config_t *cfg, char *errbuf, size_t err
         if (cfg->halow_ap.max_stas > 20) { /* MMWLAN_AP_MAX_STAS_LIMIT, mmwlan.h */
             GW_REJECT("HaLow AP max_stas must be 20 or fewer");
         }
-        struct in_addr tmp;
-        if (inet_aton(cfg->halow_ap.ip, &tmp) == 0) {
-            GW_REJECT("HaLow AP IP '%s' is not a valid address", cfg->halow_ap.ip);
-        }
-        if (inet_aton(cfg->halow_ap.netmask, &tmp) == 0) {
-            GW_REJECT("HaLow AP netmask '%s' is not a valid address", cfg->halow_ap.netmask);
+        /* No gateway field - this radio's own address terminates the
+         * subnet, leaves point directly at it (gw_config.h's own comment on
+         * gw_halow_ap_config_t.ip). */
+        esp_err_t sub_err = validate_host_subnet("HaLow AP", cfg->halow_ap.ip, cfg->halow_ap.netmask, NULL,
+                                                   NULL, NULL, errbuf, errbuf_len);
+        if (sub_err != ESP_OK) {
+            return sub_err;
         }
     }
 
@@ -436,15 +542,21 @@ const char *provisioning_security_name(gw_security_mode_t sec)
 
 /* HaLow (802.11ah) has no WPA2-PSK mode - only open/OWE/SAE, confirmed
  * against the real morsemicro/halow SDK's enum mmwlan_security_type. */
-gw_security_mode_t provisioning_parse_security(const char *s)
+bool provisioning_parse_security(const char *s, gw_security_mode_t *out)
 {
+    if (strcmp(s, "open") == 0) {
+        *out = GW_SECURITY_OPEN;
+        return true;
+    }
     if (strcmp(s, "owe") == 0) {
-        return GW_SECURITY_OWE;
+        *out = GW_SECURITY_OWE;
+        return true;
     }
     if (strcmp(s, "sae") == 0) {
-        return GW_SECURITY_SAE;
+        *out = GW_SECURITY_SAE;
+        return true;
     }
-    return GW_SECURITY_OPEN;
+    return false;
 }
 
 const char *provisioning_role_name(gw_node_role_t role)
@@ -540,7 +652,11 @@ static int cmd_gwcfg_set_uplink(int argc, char **argv)
     gw_config_t work = *s_cfg;
     strlcpy(work.uplink.ssid, argv[1], sizeof(work.uplink.ssid));
     strlcpy(work.uplink.psk, strcmp(argv[2], "-") == 0 ? "" : argv[2], sizeof(work.uplink.psk));
-    work.uplink.security = provisioning_parse_security(argv[3]);
+    if (!provisioning_parse_security(argv[3], &work.uplink.security)) {
+        provisioning_config_unlock();
+        printf("rejected: security mode '%s' not recognized (use open, owe or sae)\n", argv[3]);
+        return 1;
+    }
 
     char reason[96];
     if (provisioning_validate(&work, reason, sizeof(reason)) != ESP_OK) {
@@ -724,7 +840,11 @@ static int cmd_gwcfg_set_halow_ap(int argc, char **argv)
     /* AP mode doesn't support OWE (mmwlan.h) - reusing provisioning_parse_security()
      * here means "owe" is parseable but provisioning_validate() below rejects it,
      * same as any other bad value, rather than silently mapping it to open. */
-    work.halow_ap.security = provisioning_parse_security(argv[3]);
+    if (!provisioning_parse_security(argv[3], &work.halow_ap.security)) {
+        provisioning_config_unlock();
+        printf("rejected: security mode '%s' not recognized (use open or sae)\n", argv[3]);
+        return 1;
+    }
     work.halow_ap.op_class = (int16_t)atoi(argv[4]);
     work.halow_ap.s1g_chan_num = (uint8_t)atoi(argv[5]);
 
@@ -1076,6 +1196,105 @@ static int cmd_gwcfg_reset_auth(int argc, char **argv)
     return err == ESP_OK ? 0 : 1;
 }
 
+/* The one channel an operator has to verify the web UI's self-signed
+ * certificate against before trusting a browser warning - same role an SSH
+ * host key fingerprint plays, since no CA can issue one for a private IP
+ * (review finding F02, design/PROJECT_REVIEW_2026-09-10.md). Also logged
+ * once at boot by tls_identity_init() (main/app_main.c), so this command is
+ * for re-reading it later, not the only place it's ever shown. */
+static int cmd_gwcfg_show_cert(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    if (!tls_identity_is_ready()) {
+        printf("no HTTPS identity yet - this shouldn't happen after a successful boot\n");
+        return 1;
+    }
+    char fp[TLS_IDENTITY_FINGERPRINT_HEX_LEN + 1];
+    tls_identity_get_fingerprint_hex(fp, sizeof(fp));
+    printf("certificate SHA-256 fingerprint: %s\n", fp);
+    printf("compare this against what your browser shows before accepting its warning\n");
+    return 0;
+}
+
+/* Recovery path for a suspected-compromised device key, without a full
+ * factory reset (which would also drop the admin credential, radio
+ * passphrases and every other setting). Same "physically-present recovery
+ * action, immediate effect, no reboot" shape as gwcfg-reset-auth above -
+ * tls_identity_regenerate() does its own locking and provisioning_save(). */
+static int cmd_gwcfg_reset_tls_identity(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    if (!s_cfg) {
+        return 1;
+    }
+    esp_err_t err = tls_identity_regenerate(s_cfg);
+    if (err != ESP_OK) {
+        printf("failed to regenerate HTTPS identity: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+    char fp[TLS_IDENTITY_FINGERPRINT_HEX_LEN + 1];
+    tls_identity_get_fingerprint_hex(fp, sizeof(fp));
+    printf("new HTTPS identity generated and saved - new fingerprint: %s\n", fp);
+    printf("every browser that already trusted the old certificate will show a fresh warning "
+           "next visit - that is expected, verify the new fingerprint before accepting it\n");
+    return 0;
+}
+
+/* The one channel a physically-present operator has to claim first
+ * ownership of an unclaimed device (review finding F03,
+ * design/PROJECT_REVIEW_2026-09-10.md) - the web UI's first-use form asks
+ * for this alongside the new password, and it must match before
+ * POST /api/auth/password will commit one. Also logged once at boot by
+ * auth_init() (main/app_main.c) while onboarding is open, so this command
+ * is for re-reading it later or after a reboot, not the only place it's
+ * ever shown. */
+static int cmd_gwcfg_show_setup_secret(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    char secret[AUTH_SETUP_SECRET_HEX_LEN + 1];
+    if (!auth_get_setup_secret_hex(secret, sizeof(secret))) {
+        printf(auth_password_is_set() ? "already claimed - no setup code to show\n"
+                                       : "onboarding is closed - use gwcfg-reopen-onboarding to claim this "
+                                         "device\n");
+        return 1;
+    }
+    printf("device setup code: %s\n", secret);
+    printf("present this in the web UI's first-use form to claim admin ownership\n");
+    return 0;
+}
+
+/* Recovery path for an operator who let the onboarding boot budget run out
+ * (AUTH_ONBOARDING_BOOT_BUDGET, main/auth.c) before claiming the device -
+ * without this, a closed window would need a full factory reset (which also
+ * drops the admin credential slot, radio passphrases and every other
+ * setting - nothing to drop here since none of that exists yet on an
+ * unclaimed device, but it's still the wrong-sized tool for "I just need a
+ * fresh setup code"). Same "physically-present recovery action, immediate
+ * effect, no reboot" shape as gwcfg-reset-auth/gwcfg-reset-tls-identity
+ * above - auth_reopen_onboarding() does its own locking and
+ * provisioning_save(). */
+static int cmd_gwcfg_reopen_onboarding(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    esp_err_t err = auth_reopen_onboarding();
+    if (err == ESP_ERR_INVALID_STATE) {
+        printf("already claimed - nothing to reopen\n");
+        return 1;
+    }
+    if (err != ESP_OK) {
+        printf("failed to reopen onboarding: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+    char secret[AUTH_SETUP_SECRET_HEX_LEN + 1];
+    auth_get_setup_secret_hex(secret, sizeof(secret));
+    printf("onboarding reopened - new setup code: %s\n", secret);
+    return 0;
+}
+
 esp_err_t provisioning_register_console_commands(gw_config_t *cfg)
 {
     s_cfg = cfg;
@@ -1093,6 +1312,10 @@ esp_err_t provisioning_register_console_commands(gw_config_t *cfg)
         { .command = "gwcfg-save", .help = "Persist current config to NVS", .hint = NULL, .func = &cmd_gwcfg_save },
         { .command = "gwcfg-reset", .help = "Reset in-RAM config to built-in defaults", .hint = NULL, .func = &cmd_gwcfg_reset },
         { .command = "gwcfg-reset-auth", .help = "Clear the web UI admin credential and drop sessions immediately (no reboot)", .hint = NULL, .func = &cmd_gwcfg_reset_auth },
+        { .command = "gwcfg-show-cert", .help = "Show the web UI's HTTPS certificate fingerprint - verify against your browser before trusting it", .hint = NULL, .func = &cmd_gwcfg_show_cert },
+        { .command = "gwcfg-reset-tls-identity", .help = "Generate a fresh HTTPS certificate/key immediately (no reboot) - for a suspected-compromised key", .hint = NULL, .func = &cmd_gwcfg_reset_tls_identity },
+        { .command = "gwcfg-show-setup-secret", .help = "Show the setup code needed to claim first admin ownership of this device", .hint = NULL, .func = &cmd_gwcfg_show_setup_secret },
+        { .command = "gwcfg-reopen-onboarding", .help = "Reopen the first-ownership claim window with a fresh setup code (no reboot) - for a timed-out window", .hint = NULL, .func = &cmd_gwcfg_reopen_onboarding },
         { .command = "gwcfg-status", .help = "Show live uplink/relay state, RSSI and IPs", .hint = NULL, .func = &cmd_gwcfg_status },
         { .command = "gwcfg-cot-test", .help = "Bench test: inject <count> CoT datagrams <interval_ms> apart; read loss off the other node's counters", .hint = NULL, .func = &cmd_gwcfg_cot_test },
         { .command = "gwcfg-scan", .help = "Scan for HaLow APs on this build's channel list", .hint = NULL, .func = &cmd_gwcfg_scan },

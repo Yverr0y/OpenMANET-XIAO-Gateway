@@ -49,6 +49,7 @@ static const struct {
     { "factory_reset",   GW_STACK_FACTORY_RESET },
     { "httpd",           GW_STACK_WEB_UI },
     { "evtloop",         HALOW_EVTLOOP_STACK },
+    { "tls_id_gen",      GW_STACK_TLS_IDENTITY_GEN },
 };
 
 size_t task_stats_each_stack(task_stack_cb_t cb, void *ctx)

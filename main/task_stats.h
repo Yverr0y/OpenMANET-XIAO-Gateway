@@ -39,7 +39,32 @@ extern "C" {
  * +1024 is a proactive margin, not a tightly-derived number - re-measure via
  * gwcfg-tasks/GET /api/tasks under a real login attempt on hardware and
  * raise again if headroom is still thin. */
-#define GW_STACK_WEB_UI          7168
+/* 7168 -> 10240 for review finding F02's HTTPS switch
+ * (design/PROJECT_REVIEW_2026-09-10.md): a TLS handshake runs the ECDSA
+ * sign/verify and key-exchange math directly on this task, well beyond the
+ * single small HMAC call the 6144->7168 raise above was sized for.
+ * 10240 is esp_https_server.h's own HTTPD_SSL_CONFIG_DEFAULT() stack_size -
+ * ESP-IDF's documented figure for exactly this task shape, not a guess -
+ * used as the starting point rather than re-deriving it. Proactive, same as
+ * the raise above: re-measure via gwcfg-tasks/GET /api/tasks under a real
+ * TLS handshake on hardware and raise again if headroom is thin. */
+#define GW_STACK_WEB_UI          10240
+
+/* One-shot, self-deleting task (same shape as GW_STACK_DATAPATH - "absent" in
+ * gwcfg-tasks/GET /api/tasks is its normal post-boot state, not a fault) that
+ * runs ECDSA P-256 key generation and X.509 certificate signing for
+ * tls_identity_init()/tls_identity_regenerate() (main/tls_identity.c, review
+ * finding F02). Confirmed necessary on real hardware, not sized by guesswork:
+ * running that work directly on FreeRTOS's default "main" task - which is
+ * where app_main() itself executes, and where tls_identity_init() used to be
+ * called from directly - overflowed it and crashed the node on first boot.
+ * CONFIG_ESP_MAIN_TASK_STACK_SIZE is 3584 in this project's sdkconfig, never
+ * sized for work like this (every dedicated task here runs at >=4096), and
+ * mbedtls's ECP/bignum code during key generation and signing walks deep
+ * enough to need real room. The exact class of bug design/ROADMAP.md's item 8
+ * already documents - a deep call chain landing on a task sized for something
+ * else entirely. */
+#define GW_STACK_TLS_IDENTITY_GEN 8192
 
 /* Deliberately the smallest in the firmware: status_led_task() reads an enum
  * and toggles a GPIO. It has no room for a log call, and shouldn't grow one -

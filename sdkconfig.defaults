@@ -14,6 +14,38 @@ CONFIG_LWIP_IPV4_NAPT=y
 # can be forwarded out the other one without risking a loop.
 CONFIG_LWIP_NETBUF_RECVINFO=y
 
+# Explicit lwIP socket budget (review finding F13,
+# design/PROJECT_REVIEW_2026-09-10.md: "socket budgets conflict with maximum
+# HTTP concurrency" - this project was relying on the Kconfig default of 10
+# happening to be enough, undocumented and, for GW_ROLE_RELAY, exactly at the
+# edge with zero margin). Every subsystem that opens a socket, counted
+# against the real ESP-IDF/this-project source, not assumed:
+#
+#   - Web UI (esp_https_server, since the 2026-09-10 HTTPS switch - review
+#     finding F02): HTTPD_SSL_CONFIG_DEFAULT() sets max_open_sockets=4
+#     (esp_https_server.h), and esp_http_server.h's own max_open_sockets doc
+#     comment states "3 sockets are reserved for internal working of the HTTP
+#     server" - so this alone is 4 + 3 = 7 sockets, always, both roles.
+#   - CoT relay (main/cot_relay.c): 1 - a single socket joined to the group
+#     on both netifs (s_sock), both roles.
+#   - DNS forwarder (main/dns_forward.c): 2 - s_listen_sock (leaves query
+#     this) + s_upstream_sock (talks to the real resolver). GW_ROLE_RELAY
+#     only.
+#
+# GW_ROLE_CLIENT needs 7 + 1 = 8. GW_ROLE_RELAY needs 7 + 1 + 2 = 10 -
+# exactly CONFIG_LWIP_MAX_SOCKETS' Kconfig default, meaning a relay boots
+# with *zero* spare sockets for anything else lwIP might transiently need
+# (e.g. a browser tab's TCP connection lingering in TIME_WAIT after close).
+# +4 margin over the relay's own 10-socket requirement, not a round number -
+# `struct netconn` is a real, non-trivial struct and
+# MEMP_NUM_NETCONN == CONFIG_LWIP_MAX_SOCKETS (components/lwip/port/include/
+# lwipopts.h) preallocates one per socket slot regardless of whether it's
+# ever opened. Measured on real hardware (a GW_ROLE_RELAY node, idle, uplink
+# associated, one HaLow leaf attached), not guessed: free internal heap went
+# from 103,279 bytes at 10 to 101,579 bytes at 14 - 1,700 bytes for 4 extra
+# slots, ~425 bytes/socket. Cheap for going from zero spare sockets to four.
+CONFIG_LWIP_MAX_SOCKETS=14
+
 # The native 2.4GHz radio runs in exactly one mode per node, never both:
 # GW_ROLE_CLIENT (default) uses it AP-only for the local SoftAP
 # (downlink_softap.c), while HaLow carries that role's uplink on the separate
@@ -280,3 +312,39 @@ CONFIG_LWIP_IPV4_NAPT_PORTMAP=n
 # measured worst case - comfortably clear of both bands with real headroom
 # for whatever ESP-IDF itself needs there in the future.
 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
+
+# --- HTTPS for the web UI/config API (review finding F02,
+# design/PROJECT_REVIEW_2026-09-10.md - overturns the "TLS: No" settled
+# decision this file used to carry; see design/ROADMAP.md "Settled decisions"
+# for the full reasoning change). ---
+
+# esp_https_server's own top-level enable flag - gates its Kconfig submenu and
+# depends on (ESP_TLS_USING_MBEDTLS && MBEDTLS_TLS_SERVER)
+# (esp_https_server/Kconfig L3-7 at v5.5.1); MBEDTLS_TLS_SERVER was already =y
+# in this project's sdkconfig before this line existed (an ESP-IDF default,
+# not something turned on for this).
+CONFIG_ESP_HTTPS_SERVER_ENABLE=y
+
+# Routes mbedtls's dynamic allocations (TLS session buffers, X.509 parse/write
+# scratch, handshake big-number work) into the 8MB PSRAM pool enabled above,
+# instead of the ~512KB internal SRAM this project has been guarding closely
+# (heap_guard.c's GW_HEAP_*_SHED_BYTES thresholds sit in the tens of KB).
+# esp_https_server.h's own HTTPD_SSL_CONFIG_DEFAULT() comment says "one socket
+# uses ~40kB RAM with SSL" - that alone would eat roughly a third of this
+# board's measured ~109-130KB free internal SRAM (design/ROADMAP.md,
+# 2026-08-30) per open HTTPS connection if left on internal SRAM.
+#
+# Dependency (mbedtls/Kconfig's MBEDTLS_MEM_ALLOC_MODE choice,
+# MBEDTLS_EXTERNAL_MEM_ALLOC entry): SPIRAM_USE_CAPS_ALLOC ||
+# SPIRAM_USE_MALLOC - already satisfied by CONFIG_SPIRAM_USE_MALLOC=y above.
+#
+# Tradeoff, recorded rather than hidden: mbedtls's own Kconfig help text notes
+# internal SRAM is "most preferred from security perspective" unless flash
+# encryption is on (which the same text says also encrypts PSRAM contents on
+# S2/S3). This board doesn't have flash encryption yet (review finding F14,
+# staged for Stage E - design/PROJECT_REVIEW_2026-09-10.md), so TLS session
+# material and the device's own private key sit in cleartext PSRAM while in
+# use. That's the same accepted risk profile the admin credential and radio
+# passphrases already have sitting in cleartext NVS at rest - not a new gap,
+# and worth revisiting together with F14 rather than in isolation.
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y

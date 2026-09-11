@@ -368,6 +368,23 @@ esp_err_t cot_relay_inject(const void *data, size_t len)
 
 void cot_relay_get_counters(cot_relay_counters_t *out_uplink, cot_relay_counters_t *out_downlink)
 {
+    /* s_send_lock is NULL until cot_relay_start() succeeds - a fresh boot, an
+     * unconfigured uplink, or a failed start all reach this function that way
+     * (status_get_handler() calls it unconditionally). Taking a NULL
+     * semaphore isn't a no-op: FreeRTOS-Kernel/queue.c's xQueueSemaphoreTake
+     * asserts its queue handle is non-NULL, so this would panic rather than
+     * just misbehave. Report zero counters instead - review finding F01,
+     * design/PROJECT_REVIEW_2026-09-10.md. */
+    if (s_send_lock == NULL) {
+        if (out_uplink != NULL) {
+            memset(out_uplink, 0, sizeof(*out_uplink));
+        }
+        if (out_downlink != NULL) {
+            memset(out_downlink, 0, sizeof(*out_downlink));
+        }
+        return;
+    }
+
     xSemaphoreTake(s_send_lock, portMAX_DELAY);
     if (out_uplink != NULL) {
         *out_uplink = s_counters_a;

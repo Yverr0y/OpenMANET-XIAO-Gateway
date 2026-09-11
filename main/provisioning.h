@@ -49,7 +49,12 @@ esp_err_t provisioning_save(const gw_config_t *cfg);
 
 /* Shared uplink-security (de)serialization, used by both the console
  * (gwcfg-set-uplink) and the web UI so the two never drift apart. */
-gw_security_mode_t provisioning_parse_security(const char *s);
+/* Parses "open"/"owe"/"sae" into *out and returns true. An unrecognized
+ * string returns false and leaves *out untouched - callers must reject the
+ * request rather than fall back to a default, so a typo like "saee" can't
+ * silently configure an open radio (review finding F10,
+ * design/PROJECT_REVIEW_2026-09-10.md). */
+bool provisioning_parse_security(const char *s, gw_security_mode_t *out);
 const char *provisioning_security_name(gw_security_mode_t sec);
 
 /* Same pattern, for gw_node_role_t - shared by the console (gwcfg-set-role)
