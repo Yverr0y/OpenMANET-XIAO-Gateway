@@ -273,23 +273,50 @@ errors, zero warnings, binary size unchanged at 41% free. Not yet verified on ha
       diagnostic reorder is not in the tree). Notably, `design/ROADMAP.md`'s own Aug 29 relay-run
       notes below record this exact node successfully reaching "native Wi-Fi uplink associated and
       got a DHCP lease" on that date - so this is a **regression introduced since Aug 29**, not a
-      bug that's always been there, most likely from this session's own HTTPS switch (F02: the
-      `httpd` task's stack grew 6144 → 7168 → 10240 bytes, and `esp_https_server`/mbedtls's own
-      internal-RAM footprint) and/or the F13 socket-budget raise (`CONFIG_LWIP_MAX_SOCKETS` 10 → 14,
-      ~1.7 KB more permanently reserved) tightening the internal (non-PSRAM) heap `esp_wifi_init()`
-      needs for its own DMA-capable buffers enough to push a marginal vendor init path from a clean
-      failure into a watchdog hang. Not yet root-caused or fixed - open as its own item below Stage B
-      rather than folded into F06, since F06's own scope (owning/serializing the *HaLow* radio API)
-      is what's actually fixed and hardware-verified.
+      bug that's always been there. **Internal-RAM starvation from F02/F13 was the first suspect but
+      is now ruled out by direct measurement**: `heap_caps_get_free_size()`/`_get_largest_free_block()`
+      logged immediately before `uplink_wifi_init()` showed 190,907 bytes free internal
+      (118,784 largest contiguous block) and 183,119 bytes free DMA-capable - identical across every
+      crash, and far more than `esp_wifi_init()` needs. Not yet root-caused or fixed - open as its
+      own item below Stage B rather than folded into F06, since F06's own scope (owning/serializing
+      the *HaLow* radio API) is what's actually fixed and hardware-verified.
 - [ ] Native Wi-Fi uplink bring-up crashes `GW_ROLE_RELAY` (regression since Aug 29, found while
       hardware-verifying F06) — P0 — `uplink_wifi_init()`'s `esp_wifi_init()`/`esp_wifi_start()`
       call trips a `TG1WDT_SYS_RST` interrupt watchdog inside Espressif's own closed
       `wifi_lmac_init`/`wDev_Rxbuf_Init`, 100% reproducibly, immediately after the HaLow AP has
-      already started successfully. See F06's entry above for the full investigation so far
-      (symbolized backtrace, the reorder experiment that ruled out simple call-order and pointed at
-      a possible internal-RAM/current budget issue instead, and the suspected connection to this
-      session's own F02/F13 changes). Blocks full `GW_ROLE_RELAY` hardware verification - the HaLow
-      AP downlink now works, but the Wi-Fi uplink to the Pi does not.
+      already started successfully. **Current leading hypothesis: a physical power-delivery limit,
+      not a firmware bug** - see the evidence trail below before trying more code-side fixes.
+
+      A second diagnostic reorder (native Wi-Fi before the HaLow AP, matching `bring_up_client_role()`'s
+      already-working structure of "native radio first, HaLow second") was tried and also reverted
+      (not committed). It didn't clean up the crash - it changed its signature: every failure now
+      reports `esp_reset_reason() == ESP_RST_POWERON` ("power-on", not any watchdog) on a strikingly
+      regular ~3-4s cadence (confirmed against `journalctl -k`'s USB re-enumeration timestamps, not
+      just the firmware's own claim), and the ROM bootloader banner (`ESP-ROM:esp32s3...`) never
+      appears at all across 30s of captured serial output - unlike the original order's crash, where
+      the banner and `rst:0x8 (TG1WDT_SYS_RST)` line came through cleanly on every single cycle. That
+      difference matters: it means the reordered failure is severe enough to disrupt the USB
+      peripheral's own enumeration, i.e. a lower-level reset than a software-detected watchdog. It
+      also got further at least once before failing again - `uplink_wifi: Wi-Fi uplink associated
+      (RSSI -66 dBm), waiting for DHCP lease...` - so this isn't a hard, instant failure either order.
+      Taken together (healthy heap either way; a regular, fast reset cadence; a signature that gets
+      *worse*, not better, when the two radios' power-up windows are pushed closer together; and this
+      exact board/cable pairing already flagged once this session for unrelated flaky-USB symptoms -
+      see "they devices keep restarting" in git/session history), the leading theory is that
+      concurrent HaLow-beacon-plus-native-WiFi-PHY-calibration current draw exceeds what this specific
+      USB port/cable can source, and the *original* order's `TG1WDT_SYS_RST` may itself be a milder
+      symptom of the same marginal supply (a voltage dip enough to desync timing without crossing the
+      full POR threshold) rather than a pure scheduling bug.
+
+      **Next step needs hands on the hardware, not more code**: retest the relay board (original,
+      committed call order) on a different USB cable/port, ideally a powered hub or a bench supply
+      capable of a clean current spike, and see whether the crash disappears entirely. If it does,
+      this was never a firmware bug. If it persists on genuinely clean power, that reopens the
+      software investigation - candidates at that point would include a deliberate delay/settling
+      window between the two radios' power-up (tried once as a reorder, not yet tried as a delay on
+      top of the original order), or a Kconfig-level look at `esp_wifi_init()`'s own buffer/DMA
+      allocation options. Blocks full `GW_ROLE_RELAY` hardware verification either way - the HaLow AP
+      downlink now works, but the Wi-Fi uplink to the Pi does not.
 - [ ] F07 — P1 — scan timeout doesn't synchronize against callback lifetime
 - [ ] F08 — P1 — datapath bring-up is one-shot; recovery after address/partial-failure/timing races is incomplete
 - [ ] F11 — P1 — saved config and active network state are conflated (no desired/active split)
