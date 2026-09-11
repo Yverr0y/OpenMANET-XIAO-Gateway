@@ -1836,7 +1836,27 @@ el('scanBtn').addEventListener('click', async function () {
       var text = await res.text().catch(function () { return ''; });
       throw new Error(text ? text.replace(/<[^>]*>/g, '').trim() : 'HTTP ' + res.status);
     }
-    var data = await res.json();
+
+    // The scan itself takes several seconds; the POST above only submits it
+    // (main/uplink_halow.h's uplink_halow_scan_start()/_poll() comment - the
+    // firmware doesn't hold this request open for the scan's duration any
+    // more), so poll GET /api/scan for the result instead of expecting it in
+    // the POST response. 30 x 500ms = 15s is comfortably past the firmware's
+    // own WEB_UI_SCAN_TIMEOUT_MS (8s, main/web_ui.c) deadline, which is what
+    // actually bounds how long a scan can stay "running" server-side - this
+    // is just a client-side backstop in case a poll response never arrives.
+    var data = null;
+    for (var attempt = 0; attempt < 30; attempt++) {
+      await new Promise(function (resolve) { setTimeout(resolve, 500); });
+      var poll = await fetch('/api/scan', { cache: 'no-store' });
+      if (poll.status === 401) { handleAuthExpiry(); return; }
+      if (!poll.ok) throw new Error('HTTP ' + poll.status);
+      data = await poll.json();
+      if (!data.running) break;
+    }
+    if (!data || data.running) {
+      throw new Error('scan is taking longer than expected - try again');
+    }
     var aps = data.aps || [];
     if (!aps.length) {
       out.innerHTML = '<p class="hint" style="color:var(--color-warn);">No HaLow APs found in region ' +

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "esp_err.h"
@@ -109,7 +110,11 @@ int32_t uplink_halow_get_rssi(void);
  * is counted in the "scan complete"/"scan ended early" log line but not
  * delivered), then returns once the scan completes or timeout_ms elapses.
  * Blocks the calling task; cb is invoked from that same task, after the wait
- * is already over - see uplink_scan_cb_t's own comment.
+ * is already over - see uplink_scan_cb_t's own comment. Built on top of
+ * uplink_halow_scan_start()/_poll() below - see those for the non-blocking
+ * version. Kept around because it's exactly what a console command wants:
+ * gwcfg-scan (provisioning.c) blocking its own task for the scan's duration
+ * is the right UX for a synchronous CLI, unlike an HTTP request handler.
  *
  * This answers the question nothing else in this firmware can: "is the Pi's
  * HaLow AP visible at all, on what channel, at what strength?" - which is
@@ -122,6 +127,57 @@ int32_t uplink_halow_get_rssi(void);
  * proof the AP is absent. Only one scan runs at a time; concurrent callers get
  * ESP_ERR_INVALID_STATE. */
 esp_err_t uplink_halow_scan(uplink_scan_cb_t cb, void *ctx, uint32_t timeout_ms);
+
+/* Stage F review finding (design/PROJECT_REVIEW_2026-09-10.md): "make scans
+ * asynchronous and bounded" - uplink_halow_scan() above blocks its caller for
+ * the scan's full duration (WEB_UI_SCAN_TIMEOUT_MS = 8s in web_ui.c), which
+ * for an HTTP request handler means blocking the single-threaded httpd task
+ * for that long - no other request (not even /api/status) is served until it
+ * returns. web_ui.c's scan endpoints use this job-style pair instead:
+ * uplink_halow_scan_start() submits the scan and returns immediately
+ * (bounded only by the same RADIO_CONTROL_DEFAULT_TIMEOUT_MS every other
+ * radio_control_run() call in this file already accepts blocking on - see
+ * main/radio_control.h), and uplink_halow_scan_poll() is a cheap,
+ * non-blocking check callable from a GET handler on every page poll. There's
+ * only ever one scan job globally (the radio only supports one at a time -
+ * the same constraint uplink_halow_scan()'s own ESP_ERR_INVALID_STATE
+ * already enforces), so there's no numeric job ID to track - "is a scan
+ * running right now" is the whole of the job's state. */
+typedef enum {
+    UPLINK_HALOW_SCAN_IDLE = 0, /* no scan in progress right now */
+    UPLINK_HALOW_SCAN_RUNNING,  /* a scan submitted by _start() hasn't finished or timed out yet */
+} uplink_halow_scan_state_t;
+
+/* Submits a scan and returns immediately - does not wait for it to complete.
+ * Same channel-list/regulatory-domain and "only one at a time" notes as
+ * uplink_halow_scan() above apply identically; ESP_ERR_INVALID_STATE means a
+ * scan is already running. timeout_ms bounds how long uplink_halow_scan_poll()
+ * below will keep reporting UPLINK_HALOW_SCAN_RUNNING before giving up and
+ * finalizing with whatever was found so far, same as uplink_halow_scan()'s own
+ * timeout_ms parameter. */
+esp_err_t uplink_halow_scan_start(uint32_t timeout_ms);
+
+/* Non-blocking. Checks whether the scan started by uplink_halow_scan_start()
+ * has completed or hit its deadline and, if so, finalizes it (moves results
+ * into the cache uplink_halow_scan_get_cached_results() reads from, releases
+ * the scan slot for the next caller) before returning. Safe to call as often
+ * as a page wants to poll - each call does at most a couple of non-blocking
+ * semaphore checks and a timestamp comparison, never a radio_control_run(). */
+uplink_halow_scan_state_t uplink_halow_scan_poll(void);
+
+/* Copies the results of the most recently finalized scan into cb, same
+ * delivery contract as uplink_scan_cb_t itself. Returns false if no scan has
+ * ever finished (nothing written to *out_complete then - a scan finding zero
+ * APs is a real result and must stay distinguishable from "never ran", so
+ * this isn't inferred from a result count of 0). When it returns true,
+ * *out_complete says whether that scan finished within its deadline (false =
+ * the cached results are from a scan that timed out, same "partial success"
+ * case uplink_halow_scan()'s own ESP_ERR_TIMEOUT return represents). The
+ * cache holds the *last* finalized scan's results regardless of current
+ * state, so it's safe to call this while UPLINK_HALOW_SCAN_RUNNING reports a
+ * new scan already under way - callers get the previous scan's results until
+ * the new one finalizes. */
+bool uplink_halow_scan_get_cached_results(uplink_scan_cb_t cb, void *ctx, bool *out_complete);
 
 /* Logs the radio's BCF, firmware and morselib versions via the component's own
  * mmhalow_print_version_info(). Getting output here proves host<->MM6108 SPI

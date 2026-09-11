@@ -5,6 +5,7 @@
 
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -99,6 +100,35 @@ static struct scan_ctx {
     uint32_t count;    /* total APs seen this scan, including any beyond capacity */
     uint32_t generation;
 } s_scan;
+
+/* Async scan job state - see uplink_halow_scan_start()/_poll()'s own comments
+ * in uplink_halow.h. s_scan_state and s_scan_deadline_us are written only by
+ * uplink_halow_scan_start() (RUNNING + a fresh deadline) and
+ * uplink_halow_scan_poll() (back to IDLE, once finalized) - both always run
+ * on whichever task called them, serialized against each other the same way
+ * uplink_halow_scan() itself always was: s_scan_lock is held for the whole
+ * RUNNING window, so a second _start() while one is already in flight fails
+ * with ESP_ERR_INVALID_STATE exactly like a concurrent uplink_halow_scan()
+ * call always has.
+ *
+ * s_scan_cache is separate from s_scan.result above on purpose: s_scan.result
+ * is scratch space scan_rx_cb() is still writing into for as long as
+ * s_scan_state is RUNNING, but uplink_halow_scan_get_cached_results() must
+ * stay safely readable by an HTTP task at any time, including while a new
+ * scan is mid-flight - see that function's own "last finalized scan" comment
+ * in the header. Finalizing (in uplink_halow_scan_poll()) copies out of
+ * s_scan.result into here before releasing s_scan_lock, at the same point
+ * the old blocking uplink_halow_scan() used to deliver results via cb() -
+ * after that copy, s_scan.result is free for the next scan to overwrite
+ * without disturbing what a poller reads back out of the cache. */
+static volatile uplink_halow_scan_state_t s_scan_state = UPLINK_HALOW_SCAN_IDLE;
+static int64_t s_scan_deadline_us;
+static struct {
+    bool has_result; /* false until the first scan ever finalizes */
+    bool complete;   /* true = finished before its deadline, false = timed out */
+    uplink_scan_result_t result[UPLINK_HALOW_SCAN_MAX_RESULTS];
+    uint32_t count;
+} s_scan_cache;
 
 /* --- radio_control glue (review finding F06, design/PROJECT_REVIEW_2026-09-10.md) ---
  *
@@ -820,7 +850,48 @@ static void scan_complete_cb(enum mmwlan_scan_state state, void *arg)
     }
 }
 
-esp_err_t uplink_halow_scan(uplink_scan_cb_t cb, void *ctx, uint32_t timeout_ms)
+/* Shared tail of uplink_halow_scan_start()'s submit-failure path and
+ * uplink_halow_scan_poll()'s completion path - the same "close review
+ * finding F07, then harvest whatever scan_rx_cb() wrote" logic the old
+ * synchronous uplink_halow_scan() always ran at its own tail, retargeted to
+ * land in s_scan_cache (read later, on whichever task happens to call
+ * uplink_halow_scan_get_cached_results()) instead of a caller's cb() - see
+ * this file's "Async scan job state" comment above s_scan_cache for why.
+ * Always called with s_scan_lock held; releases it before returning. */
+static void finalize_scan(esp_err_t err)
+{
+    /* Bump the generation before touching s_scan.result/count, not after:
+     * this - not the check inside scan_rx_cb() - is what actually closes
+     * review finding F07 (see struct scan_ctx's own comment above). Any
+     * scan_rx_cb() invocation that hasn't already passed its generation
+     * check by this exact point will bail instead of writing into a result
+     * slot this function is about to read; nothing below this line can race
+     * it any more. Safe to call even when the scan never started - s_scan.count
+     * is still 0 from the reset in uplink_halow_scan_start(), so the copy
+     * loop below is a no-op. */
+    s_scan.generation++;
+
+    uint32_t delivered = s_scan.count < UPLINK_HALOW_SCAN_MAX_RESULTS ? s_scan.count
+                                                                       : UPLINK_HALOW_SCAN_MAX_RESULTS;
+    for (uint32_t i = 0; i < delivered; i++) {
+        s_scan_cache.result[i] = s_scan.result[i];
+    }
+    s_scan_cache.count = delivered;
+    s_scan_cache.complete = (err == ESP_OK);
+    s_scan_cache.has_result = true;
+
+    if (delivered > 0) {
+        ESP_LOGI(TAG, "scan %s: %" PRIu32 " AP(s) found%s", err == ESP_OK ? "complete" : "ended early",
+                 s_scan.count, s_scan.count > UPLINK_HALOW_SCAN_MAX_RESULTS
+                                    ? " (capacity reached, later results were dropped)"
+                                    : "");
+    }
+
+    s_scan_state = UPLINK_HALOW_SCAN_IDLE;
+    xSemaphoreGive(s_scan_lock);
+}
+
+esp_err_t uplink_halow_scan_start(uint32_t timeout_ms)
 {
     if (!s_ready || s_scan_lock == NULL || s_scan_done == NULL) {
         return ESP_ERR_INVALID_STATE;
@@ -834,14 +905,13 @@ esp_err_t uplink_halow_scan(uplink_scan_cb_t cb, void *ctx, uint32_t timeout_ms)
     uint32_t generation = s_scan.generation;
 
     /* Drain any completion left over from a previous scan that timed out, so
-     * this one doesn't return instantly on a stale signal. */
+     * this one doesn't finalize instantly on a stale signal. */
     xSemaphoreTake(s_scan_done, 0);
 
     /* s_scan_args is static (see this file's "radio_control glue" comment) -
      * safe to build in place here rather than in a local, since s_scan_lock
-     * (held for the whole duration of this function, taken just above)
-     * already guarantees only one caller of uplink_halow_scan() builds and
-     * submits it at a time. */
+     * (held for the whole RUNNING window, taken just above) already
+     * guarantees only one caller builds and submits it at a time. */
     s_scan_args = (struct mmhalow_scan_args){
         .rx_cb = scan_rx_cb,
         .complete_cb = scan_complete_cb,
@@ -852,40 +922,71 @@ esp_err_t uplink_halow_scan(uplink_scan_cb_t cb, void *ctx, uint32_t timeout_ms)
     if (err == ESP_OK) {
         err = s_scan_start_result;
     }
-    if (err == ESP_OK) {
-        if (xSemaphoreTake(s_scan_done, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
-            ESP_LOGW(TAG, "scan didn't complete within %u ms - delivering whatever was found "
-                          "before the deadline", (unsigned)timeout_ms);
-            err = ESP_ERR_TIMEOUT;
-        }
-    } else {
+    if (err != ESP_OK) {
         ESP_LOGW(TAG, "mmhalow_scan failed: %s", esp_err_to_name(err));
+        finalize_scan(err); /* nothing was submitted - releases s_scan_lock, records an empty/failed result */
+        return err;
     }
 
-    /* Bump the generation before touching s_scan.result/count, not after:
-     * this - not the check inside scan_rx_cb() - is what actually closes
-     * review finding F07 (see struct scan_ctx's own comment above). Any
-     * scan_rx_cb() invocation that hasn't already passed its generation
-     * check by this exact point will bail instead of writing into a result
-     * slot this task is about to read; nothing below this line can race it
-     * any more. Safe to do even when the scan never started - s_scan.count
-     * is still 0 from the reset above, so the delivery loop is a no-op. */
-    s_scan.generation++;
+    s_scan_deadline_us = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    s_scan_state = UPLINK_HALOW_SCAN_RUNNING;
+    return ESP_OK;
+}
 
-    uint32_t delivered = s_scan.count < UPLINK_HALOW_SCAN_MAX_RESULTS ? s_scan.count
-                                                                       : UPLINK_HALOW_SCAN_MAX_RESULTS;
-    for (uint32_t i = 0; i < delivered; i++) {
-        cb(&s_scan.result[i], ctx);
-    }
-    if (delivered > 0) {
-        ESP_LOGI(TAG, "scan %s: %" PRIu32 " AP(s) found%s", err == ESP_OK ? "complete" : "ended early",
-                 s_scan.count, s_scan.count > UPLINK_HALOW_SCAN_MAX_RESULTS
-                                    ? " (capacity reached, later results were dropped)"
-                                    : "");
+uplink_halow_scan_state_t uplink_halow_scan_poll(void)
+{
+    if (s_scan_state != UPLINK_HALOW_SCAN_RUNNING) {
+        return UPLINK_HALOW_SCAN_IDLE;
     }
 
-    xSemaphoreGive(s_scan_lock);
-    return err;
+    if (xSemaphoreTake(s_scan_done, 0) == pdTRUE) {
+        finalize_scan(ESP_OK);
+        return UPLINK_HALOW_SCAN_IDLE;
+    }
+
+    if (esp_timer_get_time() >= s_scan_deadline_us) {
+        ESP_LOGW(TAG, "scan didn't complete within its deadline - delivering whatever was found "
+                      "before it");
+        finalize_scan(ESP_ERR_TIMEOUT);
+        return UPLINK_HALOW_SCAN_IDLE;
+    }
+
+    return UPLINK_HALOW_SCAN_RUNNING;
+}
+
+bool uplink_halow_scan_get_cached_results(uplink_scan_cb_t cb, void *ctx, bool *out_complete)
+{
+    if (!s_scan_cache.has_result) {
+        return false;
+    }
+    if (out_complete != NULL) {
+        *out_complete = s_scan_cache.complete;
+    }
+    for (uint32_t i = 0; i < s_scan_cache.count; i++) {
+        cb(&s_scan_cache.result[i], ctx);
+    }
+    return true;
+}
+
+esp_err_t uplink_halow_scan(uplink_scan_cb_t cb, void *ctx, uint32_t timeout_ms)
+{
+    esp_err_t err = uplink_halow_scan_start(timeout_ms);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    /* Poll rather than block directly on s_scan_done, same as any other
+     * caller of the async pair above - see uplink_halow_scan_poll()'s own
+     * comment. 20ms keeps this console/CLI wrapper responsive without
+     * spinning; a scan takes at minimum hundreds of ms, so this adds
+     * negligible latency next to the old direct semaphore wait it replaces. */
+    while (uplink_halow_scan_poll() == UPLINK_HALOW_SCAN_RUNNING) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
+    bool complete = false;
+    uplink_halow_scan_get_cached_results(cb, ctx, &complete);
+    return complete ? ESP_OK : ESP_ERR_TIMEOUT;
 }
 
 void uplink_halow_set_state_callback(uplink_halow_state_cb_t cb, void *ctx)

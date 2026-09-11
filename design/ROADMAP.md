@@ -23,11 +23,12 @@ you're picking the project back up.**
   comment - GitHub's Actions parser evaluates `run:` block text including comments, before the
   shell ever sees it) was caught and fixed the same day, `actionlint`-verified. Stage E's secure
   boot/flash encryption (F14 production profile) is a deliberate no, not built - see that item's
-  own entry for the cost/benefit reasoning. Stage F's status-cache item is done (`link_history.c`
-  now caches both uplinks' RSSI from its existing periodic sample; `gwcfg-status`/`/api/status`
-  read the cache instead of calling the radio live on every request), hardware-verified. The one
-  still-open P0 is a power-delivery regression tracked under F06, seen on both bench boards - a
-  powered hub is the next planned test)
+  own entry for the cost/benefit reasoning. Stage F's status-cache and async-scan items are both
+  done (`link_history.c` now caches both uplinks' RSSI from its existing periodic sample;
+  `uplink_halow_scan()` is now a thin blocking wrapper over a non-blocking start/poll/cache-read
+  primitive, so `web_ui.c`'s scan endpoint no longer holds the single-threaded httpd task hostage
+  for a scan's full duration), both hardware-verified. The one still-open P0 is a power-delivery
+  regression tracked under F06, seen on both bench boards - a powered hub is the next planned test)
 
 Keep this file current: tick the checklist when a step passes, move an item out of "not built yet"
 when it lands, and add to "settled decisions" rather than re-arguing one. Historical detail
@@ -942,7 +943,33 @@ errors, zero warnings, binary size unchanged at 41% free. Not yet verified on ha
       first-sample staleness immediately after boot (`wifi RSSI: (not associated)` while `wifi uplink: up`),
       then the correct live value (`-64 dBm`, later `-66 dBm`) once the first periodic sample landed 30s
       later - confirming the cache populates and updates, not just compiles.
-- [ ] Make scans asynchronous and bounded (job-ID pattern instead of blocking the HTTP task)
+- [x] Make scans asynchronous and bounded (job-ID pattern instead of blocking the HTTP task) -
+      **landed 2026-09-11**. `uplink_halow_scan()` used to block its caller for the scan's full
+      duration (`WEB_UI_SCAN_TIMEOUT_MS` = 8s in `web_ui.c`) - and since esp_http_server serves one
+      request at a time on this project's single httpd task, that meant every other request,
+      including a page just polling `/api/status`, stalled for the same 8s. Split into
+      `uplink_halow_scan_start()`/`_poll()`/`_get_cached_results()` (`main/uplink_halow.c`/`.h`):
+      start submits the scan and returns immediately (bounded only by the existing
+      `RADIO_CONTROL_DEFAULT_TIMEOUT_MS` = 3s every other radio call already accepts blocking on);
+      poll is a non-blocking check (a couple of non-blocking semaphore takes and a timestamp
+      compare, never a `radio_control_run()`) that finalizes the scan into a small result cache once
+      it completes or times out. There's only ever one scan job globally (the radio only supports
+      one at a time, same constraint the old `ESP_ERR_INVALID_STATE` already enforced), so there's
+      no numeric job ID to track - "is a scan running right now" is the whole of the job's state.
+      `web_ui.c`'s `POST /api/scan` now only starts the job; a new `GET /api/scan` polls it, and
+      `web_ui.html`'s scan button polls that endpoint (500ms interval, 30-attempt/15s client-side
+      backstop - server-side the finalize deadline is still `WEB_UI_SCAN_TIMEOUT_MS`) instead of
+      waiting on one long request. `uplink_halow_scan()` itself stays (built on the same
+      start/poll pair internally) since it's still the right shape for `gwcfg-scan`, a synchronous
+      console command. Verified on real hardware: `idf.py build` clean (zero errors/warnings),
+      flashed to both bench boards, `gwcfg-scan` over the console on the client node found the
+      relay's HaLow AP (`xiao-relay-1`, two BSS entries at 914.5/915.0 MHz) exactly as before -
+      confirming the rebuilt blocking wrapper still delivers correct results end-to-end through the
+      new async primitives, not just that it compiles. The HTTP polling path itself
+      (`POST`/`GET /api/scan`) wasn't exercised live in this session - it's a thin JSON wrapper
+      around the same `uplink_halow_scan_start()`/`_poll()`/`_get_cached_results()` calls the console
+      path already proved, but reaching it from a browser needs a device associated to the SoftAP,
+      not available in this environment.
 - [ ] Profile before touching the 40 MHz SPI clock or NAPT table size
 - [ ] Pick and document an explicit Wi-Fi power-save policy, measured
 - [ ] Station-limit testing at 1/2/4 leaves before any "supports N clients" claim

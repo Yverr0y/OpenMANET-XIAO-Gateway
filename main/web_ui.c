@@ -969,11 +969,23 @@ static void scan_result_cb(const uplink_scan_result_t *result, void *ctx)
     cJSON_AddItemToArray(array, item);
 }
 
-/* Runs a HaLow scan and returns what it found.
+/* Starts a HaLow scan and returns immediately - answers "is the Pi's AP even
+ * there?" without a serial cable or a Pi-side capture, without blocking this
+ * endpoint's caller for the scan's duration to find out.
  *
- * This is the endpoint that answers "is the Pi's AP even there?" without a
- * serial cable or a Pi-side capture. Two things worth knowing about the
- * result, both surfaced in the page's help text:
+ * Stage F review finding (design/PROJECT_REVIEW_2026-09-10.md): "make scans
+ * asynchronous and bounded". This used to call the blocking uplink_halow_scan()
+ * directly and hold the connection open for up to WEB_UI_SCAN_TIMEOUT_MS - and
+ * since esp_http_server serves one request at a time on this single httpd
+ * task (config.httpd.lru_purge_enable is about connection reuse, not
+ * concurrency), that meant every other client, including a page just polling
+ * /api/status, stalled for the same 8s. POST here only submits the scan
+ * (uplink_halow_scan_start(), bounded by the same radio_control_run() budget
+ * every other radio call in this file already accepts blocking on); the page
+ * polls GET /api/scan below to find out when it's done.
+ *
+ * Two things worth knowing about the eventual result, both surfaced in the
+ * page's help text:
  *
  *  - it only covers channels legal in this build's CONFIG_HALOW_COUNTRY_CODE,
  *    so an empty list is evidence about the region setting as much as about
@@ -998,6 +1010,37 @@ static esp_err_t scan_post_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
+    esp_err_t scan_err = uplink_halow_scan_start(WEB_UI_SCAN_TIMEOUT_MS);
+    if (scan_err == ESP_ERR_INVALID_STATE) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "a scan is already running");
+        return ESP_FAIL;
+    }
+    if (scan_err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to start the scan");
+        return ESP_FAIL;
+    }
+
+    /* 202: accepted, not yet done - GET /api/scan below is where the result
+     * shows up. HTTPD_500_INTERNAL_SERVER_ERROR above is the only named
+     * status esp_http_server's httpd_err_code_t offers for the error paths;
+     * a literal status line is used here for the same reason, since a plain
+     * httpd_resp_send_err() would print "202" as an error page body. */
+    httpd_resp_set_status(req, "202 Accepted");
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, "{\"accepted\":true}");
+}
+
+/* Polls the scan started by POST /api/scan above. Non-blocking -
+ * uplink_halow_scan_poll() never calls into the radio, so this is cheap
+ * enough for the page to call on a short timer while a scan is running. */
+static esp_err_t scan_get_handler(httpd_req_t *req)
+{
+    if (reject_if_remote(req) || auth_require_session(req)) {
+        return ESP_FAIL;
+    }
+
+    uplink_halow_scan_state_t state = uplink_halow_scan_poll();
+
     cJSON *root = cJSON_CreateObject();
     cJSON *array = root ? cJSON_AddArrayToObject(root, "aps") : NULL;
     if (array == NULL) {
@@ -1006,17 +1049,18 @@ static esp_err_t scan_post_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    esp_err_t scan_err = uplink_halow_scan(scan_result_cb, array, WEB_UI_SCAN_TIMEOUT_MS);
-    if (scan_err == ESP_ERR_INVALID_STATE) {
-        cJSON_Delete(root);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "a scan is already running");
-        return ESP_FAIL;
-    }
+    cJSON_AddBoolToObject(root, "running", state == UPLINK_HALOW_SCAN_RUNNING);
 
-    /* A timeout still delivers whatever was found before the deadline, so it's
-     * reported as a partial success rather than an error - partial scan
-     * results are exactly as useful as complete ones here. */
-    cJSON_AddBoolToObject(root, "complete", scan_err == ESP_OK);
+    /* Always the *last finalized* scan's results, per
+     * uplink_halow_scan_get_cached_results()'s own comment - including while
+     * "running" is true and a newer scan is already under way, so a page that
+     * polls mid-scan still has something to show rather than a blank panel
+     * flickering back in once this one finishes. "complete" stays false (not
+     * just absent) until a first scan actually finishes, same shape as every
+     * other bool field here - simpler for the page than a tri-state. */
+    bool complete = false;
+    uplink_halow_scan_get_cached_results(scan_result_cb, array, &complete);
+    cJSON_AddBoolToObject(root, "complete", complete);
     cJSON_AddStringToObject(root, "country", CONFIG_HALOW_COUNTRY_CODE);
 
     char *out = cJSON_PrintUnformatted(root);
@@ -1548,13 +1592,19 @@ esp_err_t web_ui_start(gw_config_t *cfg, esp_netif_t *softap_netif)
 
     httpd_ssl_config_t config = HTTPD_SSL_CONFIG_DEFAULT();
     config.httpd.lru_purge_enable = true;
-    /* The scan handler blocks for up to WEB_UI_SCAN_TIMEOUT_MS; the default
-     * 5s socket timeouts would abort the connection before it can answer. */
+    /* POST /api/scan used to block for up to WEB_UI_SCAN_TIMEOUT_MS (the scan
+     * itself); now it only submits the scan (uplink_halow_scan_start()) and
+     * returns, so nothing left in this file blocks longer than a single
+     * radio_control_run() call (RADIO_CONTROL_DEFAULT_TIMEOUT_MS, 3s -
+     * main/radio_control.h) - see scan_post_handler()'s own comment. Left at
+     * 15s anyway rather than trimmed to match: a generous socket timeout
+     * costs nothing but a slightly later-detected dead connection, where a
+     * too-tight one risks aborting a slow-but-live one. */
     config.httpd.recv_wait_timeout = 15;
     config.httpd.send_wait_timeout = 15;
-    /* Default is 8 and there are 16 routes below - raised so adding one
+    /* Default is 8 and there are 17 routes below - raised so adding one
      * doesn't fail registration at runtime instead of at compile time. */
-    config.httpd.max_uri_handlers = 18;
+    config.httpd.max_uri_handlers = 20;
     /* The status and scan handlers build and print whole cJSON trees on this
      * stack, on top of the TLS handshake state a plain-HTTP budget never had
      * to carry - see GW_STACK_WEB_UI's own comment (task_stats.h). (Scan
@@ -1596,6 +1646,7 @@ esp_err_t web_ui_start(gw_config_t *cfg, esp_netif_t *softap_netif)
         { .uri = "/api/tasks", .method = HTTP_GET, .handler = tasks_get_handler },
         { .uri = "/api/rssi-history", .method = HTTP_GET, .handler = rssi_history_get_handler },
         { .uri = "/api/scan", .method = HTTP_POST, .handler = scan_post_handler },
+        { .uri = "/api/scan", .method = HTTP_GET, .handler = scan_get_handler },
         { .uri = "/api/reboot", .method = HTTP_POST, .handler = reboot_post_handler },
         { .uri = "/api/auth/status", .method = HTTP_GET, .handler = auth_status_get_handler },
         { .uri = "/api/auth/challenge", .method = HTTP_GET, .handler = auth_challenge_get_handler },
