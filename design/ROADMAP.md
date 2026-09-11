@@ -11,10 +11,10 @@ you're picking the project back up.**
 - Companion docs: [`HARDWARE.md`](HARDWARE.md) (what to buy, how to build one, how to bring it up),
   [`PI_SIDE.md`](PI_SIDE.md) (the other end of the link)
 - Architecture diagram and repo layout: [`../README.md`](../README.md)
-- **Last updated:** 2026-09-11 (F06's radio_control task+queue landed and hardware-verified - fixed
-  a real priority-inversion crash in `GW_ROLE_RELAY`'s HaLow AP bring-up; see Stage B below. Found,
-  while verifying it, a separate P0 regression blocking the relay role's native Wi-Fi uplink -
-  see the new item directly under F06)
+- **Last updated:** 2026-09-11 (F06 and F07 both landed and hardware-verified - see Stage B below.
+  F06 fixed a real priority-inversion crash in `GW_ROLE_RELAY`'s HaLow AP bring-up; F07 fixed a real
+  use-after-free in HaLow scan result delivery. A separate P0 regression blocking the relay role's
+  native Wi-Fi uplink, found while verifying F06, is still open - see the item directly under F06)
 
 Keep this file current: tick the checklist when a step passes, move an item out of "not built yet"
 when it lands, and add to "settled decisions" rather than re-arguing one. Historical detail
@@ -287,6 +287,14 @@ errors, zero warnings, binary size unchanged at 41% free. Not yet verified on ha
       already started successfully. **Current leading hypothesis: a physical power-delivery limit,
       not a firmware bug** - see the evidence trail below before trying more code-side fixes.
 
+      **2026-09-11 update, supports the power theory further:** switching the relay node to a
+      shorter USB cable produced a clean run - HaLow AP up, native Wi-Fi uplink associated, DHCP
+      lease, datapath fully up with a leaf associated, sustained with no reboot for as long as it
+      was observed. Not yet called fixed: no code changed between that run and the flaky ones before
+      it, so this is corroborating evidence for the power theory, not a confirmed root-cause fix. A
+      powered USB hub is the planned next test, to get a real, deliberate before/after comparison
+      rather than relying on cable-quality variance.
+
       A second diagnostic reorder (native Wi-Fi before the HaLow AP, matching `bring_up_client_role()`'s
       already-working structure of "native radio first, HaLow second") was tried and also reverted
       (not committed). It didn't clean up the crash - it changed its signature: every failure now
@@ -317,7 +325,37 @@ errors, zero warnings, binary size unchanged at 41% free. Not yet verified on ha
       top of the original order), or a Kconfig-level look at `esp_wifi_init()`'s own buffer/DMA
       allocation options. Blocks full `GW_ROLE_RELAY` hardware verification either way - the HaLow AP
       downlink now works, but the Wi-Fi uplink to the Pi does not.
-- [ ] F07 — P1 — scan timeout doesn't synchronize against callback lifetime
+- [x] F07 — P1 — scan timeout doesn't synchronize against callback lifetime. Confirmed as a real bug
+      by reading both call sites, not just the review's description: `web_ui.c`'s `scan_post_handler()`
+      calls `uplink_halow_scan(scan_result_cb, array, ...)` where `array` is a `cJSON*` it deletes
+      shortly after the call returns; `scan_rx_cb()` (invoked from the driver's own scan/event task,
+      not the caller's) checked a generation counter before touching `sc->cb`/`sc->ctx`, but nothing
+      stopped a callback that had already passed that check from being preempted, resuming after the
+      caller timed out and freed/reused that memory, and then calling `cb()` through it - a real
+      use-after-free into a cJSON tree, plus concurrent, unsynchronized mutation of that same tree
+      from two tasks even short of the free case (cJSON has no internal locking). Checking generation
+      once, as the old code did, cannot close either problem - F06's own radio_control serialization
+      doesn't help here either, since it only owns the *submission* call, not the driver's later,
+      asynchronous delivery of results.
+
+      Fixed by removing the cross-task sharing entirely rather than adding more synchronization
+      around it: `scan_rx_cb()` no longer touches a caller's `cb`/`ctx` at all - it only writes into
+      a new module-owned, bounded static array (`UPLINK_HALOW_SCAN_MAX_RESULTS = 32`, matching the
+      review's "cap record count... count overflow" acceptance criterion). `uplink_halow_scan()`
+      itself bumps the generation (retiring any further writes into that array) *before* reading it
+      back, then delivers every result to `cb(ctx)` synchronously, on its own caller's task, after
+      its wait on the driver has already returned - success or timeout. `cb`/`ctx` are now plain local
+      variables in that one function, never written from another task, so there is nothing left for a
+      late callback to race against. `main/uplink_halow.h`'s `uplink_scan_cb_t` doc comment was wrong
+      about this ("invoked... from the driver's scan task") and is corrected.
+
+      Verified on real hardware, not just a clean build: flashed the client-role leaf node
+      (`xiao-gw-2e40`) and ran `gwcfg-scan` at the console - found the relay's AP twice (two
+      configured bandwidths), delivered both results correctly, logged `scan complete: 2 AP(s) found`,
+      returned cleanly, and the node went on to associate and bring its datapath up immediately after
+      - no crash, no hang, no behavior change visible to either caller (`web_ui.c`'s cJSON path shares
+      the exact same, now-fixed delivery mechanism in `uplink_halow.c`, so this exercises the part
+      that actually changed).
 - [ ] F08 — P1 — datapath bring-up is one-shot; recovery after address/partial-failure/timing races is incomplete
 - [ ] F11 — P1 — saved config and active network state are conflated (no desired/active split)
 - [x] F13 (explicit budget + margin) — P1 — **landed 2026-09-10, ahead of the rest of Stage B at the

@@ -59,8 +59,13 @@ typedef struct {
     uint8_t bw_mhz;
 } uplink_scan_result_t;
 
-/* Invoked once per discovered AP, from the driver's scan task. Keep it short.
- * `result` is owned by the caller and only valid for the duration of the call. */
+/* Invoked once per discovered AP (up to uplink_halow_scan()'s own capacity -
+ * see main/uplink_halow.c), synchronously from within uplink_halow_scan()
+ * itself once the scan has finished or timed out - never from the driver's
+ * own scan task. Review finding F07 (design/PROJECT_REVIEW_2026-09-10.md):
+ * this used to be invoked live, from the driver's task, which raced a
+ * timed-out caller freeing `ctx`. `result` is owned by the caller and only
+ * valid for the duration of the call. */
 typedef void (*uplink_scan_cb_t)(const uplink_scan_result_t *result, void *ctx);
 
 /* One-time radio/netif bring-up. Safe to call even if the HaLow component
@@ -99,8 +104,12 @@ const char *uplink_halow_link_state_name(uplink_link_state_t state);
  * but too weak", which otherwise look identical. */
 int32_t uplink_halow_get_rssi(void);
 
-/* Runs one scan and invokes cb for each AP found, then returns once the scan
- * completes or timeout_ms elapses. Blocks the calling task.
+/* Runs one scan and invokes cb for each AP found (up to
+ * UPLINK_HALOW_SCAN_MAX_RESULTS in main/uplink_halow.c - anything past that
+ * is counted in the "scan complete"/"scan ended early" log line but not
+ * delivered), then returns once the scan completes or timeout_ms elapses.
+ * Blocks the calling task; cb is invoked from that same task, after the wait
+ * is already over - see uplink_scan_cb_t's own comment.
  *
  * This answers the question nothing else in this firmware can: "is the Pi's
  * HaLow AP visible at all, on what channel, at what strength?" - which is

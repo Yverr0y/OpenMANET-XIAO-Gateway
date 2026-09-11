@@ -47,7 +47,7 @@ static TaskHandle_t s_reconnect_task_handle = NULL;
 static SemaphoreHandle_t s_connect_sem = NULL;
 
 /* Serializes uplink_halow_scan(): the driver takes one scan request at a time,
- * and the callbacks below write into a single shared context.
+ * and scan_rx_cb() below writes into a single shared context.
  *
  * That context and its completion semaphore are deliberately static rather
  * than stack-allocated in uplink_halow_scan(). A scan that times out leaves
@@ -60,10 +60,43 @@ static SemaphoreHandle_t s_connect_sem = NULL;
 static SemaphoreHandle_t s_scan_lock = NULL;
 static SemaphoreHandle_t s_scan_done = NULL;
 
+/* Caps how many results one scan keeps. Review finding F07
+ * (design/PROJECT_REVIEW_2026-09-10.md) - see this file's own explanation
+ * below of why results are buffered here rather than delivered live. 32 is
+ * generous for this radio's own regulatory channel set in a bench/field
+ * deployment (a handful of HaLow APs, not a dense 2.4GHz venue); anything
+ * beyond it is counted, not silently dropped - see s_scan.overflow. */
+#define UPLINK_HALOW_SCAN_MAX_RESULTS 32
+
+/* result/count/generation are written only by scan_rx_cb() (the driver's own
+ * scan/event task) and read only by uplink_halow_scan() (whichever task
+ * called it) after that task's own wait on s_scan_done has already returned -
+ * so despite living on two different tasks, there is no point where both
+ * sides touch this struct at once: uplink_halow_scan() bumps `generation`
+ * (retiring the one scan_rx_cb() was just using) before it reads anything
+ * back out of `result`, and a scan_rx_cb() that already passed the generation
+ * check before that bump lands is, at worst, writing into a slot this task is
+ * about to stop reading past - never a slot it has already delivered.
+ *
+ * `cb`/`ctx` deliberately do NOT live here (they used to - see git history).
+ * Review finding F07 flagged exactly that: scan_rx_cb() could pass its
+ * generation check, then be preempted while uplink_halow_scan() timed out and
+ * returned to a caller that went on to free/reuse `ctx` (web_ui.c's
+ * scan_post_handler(), for one, deletes the cJSON tree `ctx` points into
+ * right after this function returns) - the callback would then resume and
+ * call cb(ctx) through memory that no longer belongs to it. Checking
+ * generation once doesn't close that window; nothing about it stops a
+ * request that already passed the check from running long after its owner
+ * gave up. Fixed by never letting scan_rx_cb() touch the caller's cb/ctx at
+ * all: it only ever writes into this module's own static `result` array, and
+ * only uplink_halow_scan() itself - on the caller's own task, synchronously,
+ * after the wait below has already returned - walks that array and invokes
+ * cb(ctx). cb/ctx are plain local variables in that function from here on,
+ * never shared across tasks, so there is nothing left for a late callback to
+ * race against. */
 static struct scan_ctx {
-    uplink_scan_cb_t cb;
-    void *ctx;
-    uint32_t count;
+    uplink_scan_result_t result[UPLINK_HALOW_SCAN_MAX_RESULTS];
+    uint32_t count;    /* total APs seen this scan, including any beyond capacity */
     uint32_t generation;
 } s_scan;
 
@@ -765,10 +798,15 @@ static void scan_rx_cb(const struct mmwlan_scan_result *result, void *arg)
     out.freq_hz = result->channel_freq_hz;
     out.bw_mhz = result->bw_mhz;
 
-    sc->count++;
-    if (sc->cb != NULL) {
-        sc->cb(&out, sc->ctx);
+    /* Store, don't deliver - see this file's struct scan_ctx comment for why
+     * scan_rx_cb() never touches a caller's cb/ctx. Bounds-checked against
+     * the cap so an AP-dense scan overwrites nothing; sc->count keeps
+     * counting past it so uplink_halow_scan() can report how many were
+     * dropped. */
+    if (sc->count < UPLINK_HALOW_SCAN_MAX_RESULTS) {
+        sc->result[sc->count] = out;
     }
+    sc->count++;
 }
 
 static void scan_complete_cb(enum mmwlan_scan_state state, void *arg)
@@ -792,8 +830,6 @@ esp_err_t uplink_halow_scan(uplink_scan_cb_t cb, void *ctx, uint32_t timeout_ms)
     }
 
     s_scan.generation++;
-    s_scan.cb = cb;
-    s_scan.ctx = ctx;
     s_scan.count = 0;
     uint32_t generation = s_scan.generation;
 
@@ -818,21 +854,36 @@ esp_err_t uplink_halow_scan(uplink_scan_cb_t cb, void *ctx, uint32_t timeout_ms)
     }
     if (err == ESP_OK) {
         if (xSemaphoreTake(s_scan_done, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
-            /* Results received so far have already been delivered to cb; the
-             * scan just never reported completion within the budget. */
-            ESP_LOGW(TAG, "scan didn't complete within %u ms", (unsigned)timeout_ms);
+            ESP_LOGW(TAG, "scan didn't complete within %u ms - delivering whatever was found "
+                          "before the deadline", (unsigned)timeout_ms);
             err = ESP_ERR_TIMEOUT;
-        } else {
-            ESP_LOGI(TAG, "scan complete: %u AP(s) found", (unsigned)s_scan.count);
         }
     } else {
         ESP_LOGW(TAG, "mmhalow_scan failed: %s", esp_err_to_name(err));
     }
 
-    /* Bumping the generation before releasing the lock retires this scan's
-     * callbacks even if the driver delivers more of them later. */
+    /* Bump the generation before touching s_scan.result/count, not after:
+     * this - not the check inside scan_rx_cb() - is what actually closes
+     * review finding F07 (see struct scan_ctx's own comment above). Any
+     * scan_rx_cb() invocation that hasn't already passed its generation
+     * check by this exact point will bail instead of writing into a result
+     * slot this task is about to read; nothing below this line can race it
+     * any more. Safe to do even when the scan never started - s_scan.count
+     * is still 0 from the reset above, so the delivery loop is a no-op. */
     s_scan.generation++;
-    s_scan.cb = NULL;
+
+    uint32_t delivered = s_scan.count < UPLINK_HALOW_SCAN_MAX_RESULTS ? s_scan.count
+                                                                       : UPLINK_HALOW_SCAN_MAX_RESULTS;
+    for (uint32_t i = 0; i < delivered; i++) {
+        cb(&s_scan.result[i], ctx);
+    }
+    if (delivered > 0) {
+        ESP_LOGI(TAG, "scan %s: %" PRIu32 " AP(s) found%s", err == ESP_OK ? "complete" : "ended early",
+                 s_scan.count, s_scan.count > UPLINK_HALOW_SCAN_MAX_RESULTS
+                                    ? " (capacity reached, later results were dropped)"
+                                    : "");
+    }
+
     xSemaphoreGive(s_scan_lock);
     return err;
 }
